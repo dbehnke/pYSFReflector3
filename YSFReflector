@@ -1413,6 +1413,15 @@ def RunServer(config):
 
 
 def printlog(log_level, mess):
+  global debug
+  
+  if isinstance(log_level, int):
+    print(check_string('M: ' + str(datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S.%f'))[:-3] + ' ' + mess))
+  else:
+    if log_level == "d" and debug == 1:
+      print(check_string('D: ' + str(datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S.%f'))[:-3] + ' ' + mess))
+
+def printlog_orig(log_level, mess):
   global filelog
   global log_basename
   global file_rotate
