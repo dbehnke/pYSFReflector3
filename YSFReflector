@@ -30,6 +30,7 @@ import re
 import configparser
 import signal
 from datetime import datetime
+from datetime import UTC
 import bisect 
 import struct
 import ysffich
@@ -1416,10 +1417,10 @@ def printlog(log_level, mess):
   global debug
   
   if isinstance(log_level, int):
-    print(check_string('M: ' + str(datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S.%f'))[:-3] + ' ' + mess))
+    print(check_string('M: ' + str(datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S.%f'))[:-3] + ' ' + mess))
   else:
     if log_level == "d" and debug == 1:
-      print(check_string('D: ' + str(datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S.%f'))[:-3] + ' ' + mess))
+      print(check_string('D: ' + str(datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S.%f'))[:-3] + ' ' + mess))
 
 def printlog_orig(log_level, mess):
   global filelog
