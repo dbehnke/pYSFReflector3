@@ -1559,7 +1559,13 @@ def RunServer(config):
                         rx_lock.append(id_corr)  
                         # Include stream id and DG-ID (if available) in logs to diagnose rx_lock reasons
                         try:
-                          dgid_info = str(tx[9]) if 'tx' in locals() and isinstance(tx, (list, tuple)) and len(tx) > 9 else (str(gw_tx[8]) if 'gw_tx' in locals() and len(gw_tx) > 8 else '?')
+                          # Prefer an explicitly-set tx[9] (DG-ID); if it's default/zero, fall back to gw_tx[8]
+                          if ('tx' in locals() and isinstance(tx, (list, tuple)) and len(tx) > 9 and tx[9]):
+                            dgid_info = str(tx[9])
+                          elif ('gw_tx' in locals() and isinstance(gw_tx, (list, tuple)) and len(gw_tx) > 8):
+                            dgid_info = str(gw_tx[8])
+                          else:
+                            dgid_info = '?'
                         except Exception:
                           dgid_info = '?'
                         printlog(1, 'Data from ' + data[14:24].decode().strip().ljust(10) + ' at ' + data[4:14].decode().strip().ljust(10) + ' blocked/' + block_r + ' stream_id=' + str(id_corr) + ' dgid=' + dgid_info)
