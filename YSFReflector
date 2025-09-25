@@ -1296,6 +1296,42 @@ def RunServer(config):
               data_mod = bytearray(data) 
               # Use optimized client lookup
               gw_tx = client_manager.find_client(addr[0], addr[1], s)
+              # Fallback: if no exact match (different source port), try match by gateway name
+              # This is safer than matching by IP only when multiple clients use the same IP.
+              if (not gw_tx):
+                try:
+                  gw_name = data[4:14].decode().strip()
+                except Exception:
+                  gw_name = ''
+                if gw_name:
+                  candidates = []
+                  try:
+                    # Prefer direct access to client list if available
+                    if hasattr(client_manager, 'clients'):
+                      for cc in getattr(client_manager, 'clients'):
+                        if (len(cc) > 2) and (cc[2] == gw_name):
+                          candidates.append(cc)
+                    else:
+                      # Fallback to a potential getter if implemented
+                      if hasattr(client_manager, 'get_all_clients'):
+                        for cc in client_manager.get_all_clients():
+                          if (len(cc) > 2) and (cc[2] == gw_name):
+                            candidates.append(cc)
+                  except Exception:
+                    candidates = []
+
+                  if len(candidates) == 1:
+                    gw_tx = candidates[0]
+                    printlog(1, f'Fallback: matched gateway by name {gw_name} -> {gw_tx[0]}:{gw_tx[1]}')
+                  elif len(candidates) > 1:
+                    # Narrow candidates by IP if possible
+                    ip_match = [cc for cc in candidates if (len(cc) > 0 and cc[0] == addr[0])]
+                    if len(ip_match) == 1:
+                      gw_tx = ip_match[0]
+                      printlog(1, f'Fallback: matched gateway by name+IP {gw_name} -> {gw_tx[0]}:{gw_tx[1]}')
+                    else:
+                      if debug == 1:
+                        printlog("d", f'Fallback ambiguous for gateway name {gw_name}, candidates={len(candidates)}; skipping fallback')
               if gw_tx:
                   lock_nodi.acquire()
                   gw_tx[14] = 0
