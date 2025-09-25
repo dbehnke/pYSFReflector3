@@ -1184,6 +1184,13 @@ def RunServer(config):
             s = sock[0]
             # printlog(1,'Socket ID: ' + str(sock[1]))
             data = sanitize_msg(data_ns)
+            # Debug: log packet receipt with cmd, addr and socket DG-ID when debug enabled
+            if debug == 1:
+              try:
+                sock_dgid = sock[1] if isinstance(sock, (list, tuple)) and len(sock) > 1 else '?'
+                printlog("d", f'Received packet cmd={data[0:4]} from {addr[0]}:{addr[1]} len={len(data_ns)} socket_dgid={sock_dgid}')
+              except Exception:
+                pass
             
             # Monitor memory usage periodically
             memory_monitor()
@@ -1197,6 +1204,13 @@ def RunServer(config):
               c = client_manager.find_client(addr[0], addr[1], s)
               pres = c is not None
               if pres:
+                  # Debug: log that an existing client record was found and its DG-ID
+                  if debug == 1:
+                    try:
+                      client_dgid = c[8] if len(c) > 8 else '?'
+                      printlog("d", f'Existing client seen: {c[2] if len(c)>2 else "<no-call>"} {addr[0]}:{addr[1]} dgid={client_dgid}')
+                    except Exception:
+                      pass
                   lock_nodi.acquire()
                   c[3] = 0
                   lock_nodi.release()
