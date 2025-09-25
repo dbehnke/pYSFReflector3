@@ -423,6 +423,13 @@ def canTrasmit(cs, re_en):
       if debug == 1:
         printlog("d", f'canTrasmit: allowed by WHITE_LIST for call {call} (CheckRE=-1)')
       return True
+    # Treat -1 as permissive for valid-looking calls (fall back to regex check)
+    if (re.match(r'^\d?[A-Z]{1,2}\d{1,4}[A-Z]{1,3}$',call,re.IGNORECASE) and (len(call) <= 8)):
+      if debug == 1:
+        printlog("d", f'canTrasmit: allowed by regex fallback for call {call} (CheckRE=-1)')
+      return True
+    if debug == 1:
+      printlog("d", f'canTrasmit: denied (no rule matched) for call {call} (CheckRE=-1)')
     return False
     
     
