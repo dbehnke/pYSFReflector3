@@ -608,7 +608,12 @@ def blacklist(f_bl, t_reload, cli):
       SUF_BL = SUF_BL_TMP.copy()
       SN_BL = SN_BL_TMP.copy()
       # Sync fast lookup sets with updated lists for O(1) performance
-      fast_lookup.sync_from_lists(BLACK_LIST, WHITE_LIST, GW_BL, IP_BL, GW_LK, IP_LK, SUF_BL, SN_BL, BLK_TMP)
+      try:
+        # fast_lookup must be initialized at startup; fail here only logs and continues
+        fast_lookup.sync_from_lists(BLACK_LIST, WHITE_LIST, GW_BL, IP_BL, GW_LK, IP_LK, SUF_BL, SN_BL, BLK_TMP)
+      except Exception as e:
+        # If sync fails at runtime, log the error but do not let the blacklist thread crash
+        printlog(1, f'Error syncing fast_lookup: {e}')
       printlog(1, 'Loaded ' + str(len(BLACK_LIST)) + '/CS ' + str(len(WHITE_LIST)) + '/AL ' + str(len(GW_BL)) + '/GW ' + str(len(IP_BL)) + '/IP ' + str(len(GW_LK)) + '/GWB ' + str(len(IP_LK)) + '/IPB ' + str(len(SUF_BL)) + '/SB ' + str(len(SN_BL)) + '/SN')
       f_time_old = f_time
       update_clients(cli)
@@ -1056,7 +1061,23 @@ def RunServer(config):
     STR = stream_manager.get_all_streams()  # For backward compatibility
     
     # Initialize fast lookup manager for blacklists/whitelists
-    fast_lookup = FastLookupManager()
+    try:
+      fast_lookup = FastLookupManager()
+    except Exception as e:
+      # Fatal startup failure: log to stdout and to file if available, then exit
+      fatal_msg = f'FATAL: Failed to initialize FastLookupManager: {e}'
+      try:
+        printlog(1, fatal_msg)
+      except Exception:
+        # If printlog is not usable for some reason, fall back to stdout
+        print(fatal_msg)
+      try:
+        # Also attempt to write to the rotated log file if printlog_orig and file logging are configured
+        printlog_orig(1, fatal_msg)
+      except Exception:
+        pass
+      # Exit so orchestrators can handle restart/alerting
+      sys.exit(1)
     
     refl_name = config[1][:16]
     refl_desc = config[2][:14]
