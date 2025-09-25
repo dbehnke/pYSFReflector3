@@ -1,14 +1,13 @@
 # pYSFReflector3 Requirements
 # Core dependencies for YSF Reflector functionality
 
-# APRS integration
-aprslib>=0.7.0
+# Pin runtime dependencies (choose conservative versions tested in the venv)
+aprslib==0.7.2
+tinydb==4.8.2
+psutil==7.1.0
 
-# Database
-tinydb>=4.8.0
-
-# Memory monitoring (optional but recommended for production)
-psutil>=5.9.0
+# Test/runtime helper
+pytest==8.4.0
 
 # Note: The following are Python standard library modules (no pip install needed):
 # - socket, threading, queue, sys, os, time, re, configparser
