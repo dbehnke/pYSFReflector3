@@ -1519,7 +1519,16 @@ def RunServer(config):
                           skip_reasons.append('muted')
 
                         if debug == 1:
-                          printlog("d", f'Candidate for send: {candidate_callsign} {candidate_ip}:{candidate_port} checks skip_reasons={skip_reasons}')
+                          # Try to include stream id and dgid for better context
+                          try:
+                            cand_dgid = str(c[8]) if len(c) > 8 else '?'
+                          except Exception:
+                            cand_dgid = '?'
+                          try:
+                            stream_id = str(tx[0]) if 'tx' in locals() and isinstance(tx, (list, tuple)) else '?'
+                          except Exception:
+                            stream_id = '?'
+                          printlog("d", f'Candidate for send: {candidate_callsign} {candidate_ip}:{candidate_port} dgid={cand_dgid} stream_id={stream_id} checks skip_reasons={skip_reasons}')
 
                         if (((candidate_ip != addr[0]) or (candidate_port != addr[1]) or (not skip_reasons)) and (id_corr == tx[0]) and (id_corr != 0) and (id_corr not in rx_lock) and (c[7] == 0)):
                           try:
