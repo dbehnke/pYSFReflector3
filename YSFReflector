@@ -102,12 +102,17 @@ def check_string(l):
 
 
 def RecvData(sock,recvPackets):
-    while True:
+    global shutdown_requested
+    while not shutdown_requested:
         try:
           data,addr = sock[0].recvfrom(2048)    # block if I don't receive anything 
           recvPackets.put((data,addr,sock))
-        except:
-          printlog(1, 'Error in RecvData') 
+        except OSError as e:
+          printlog(1, f'Socket error in RecvData: {e}')
+          if e.errno in [9, 104]:  # Bad file descriptor or Connection reset
+            break
+        except Exception as e:
+          printlog(1, f'Unexpected error in RecvData: {type(e).__name__}: {e}') 
         
 
 def CalcID(ref):
@@ -129,7 +134,8 @@ def CalcID(ref):
         
 def ElencoNodi(cl,qjs):
   global SCHED
-  while True:
+  global shutdown_requested
+  while not shutdown_requested:
     time.sleep(120)
     n_r = 0
     cl_lo = []
@@ -166,7 +172,8 @@ def ElencoNodi(cl,qjs):
 
 def TimeoutNodi(cl):
   global lock_nodi
-  while True:
+  global shutdown_requested
+  while not shutdown_requested:
     time.sleep(1)
     for c in cl:
       bth = False
@@ -232,6 +239,12 @@ def TimeoutTX(stream, t_lock, r_lock, t_out, t_react, jsmess):
         bisect.insort(BLK_TMP,t[3])  
         printlog(1, 'Timeout ' + t[3])
         t_sched =  time.time() + t_react
+        
+        # Enforce scheduler limit to prevent memory exhaustion
+        if len(SCHED) >= MAX_SCHEDULED_TASKS:
+          printlog(1, f'Maximum scheduled tasks ({MAX_SCHEDULED_TASKS}) reached, removing oldest task')
+          SCHED.pop(0)  # Remove oldest task
+        
         SCHED.append([t[3], 'RCT', t_sched])       # append scheduled remove from blocked list
         printlog(1, 'Appended scheduled job: ' + t[3] + '/RC at time '  + time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(t_sched))) 
         jsmess.put('{"stream_timeout": "' +  str(t[5]).zfill(7) + '", "CS": "' + t[3] + '", "time": "' +  str(datetime.datetime.now(datetime.UTC).strftime('%Y-%m-%d %H:%M:%S.%f'))[:-3] + '"}')
@@ -253,7 +266,8 @@ def TimeoutTX(stream, t_lock, r_lock, t_out, t_react, jsmess):
 def scheduler():
   global BLK_TMP
   global SCHED
-  while True:
+  global shutdown_requested
+  while not shutdown_requested:
     time.sleep(1)
     t = time.time()
     try:
@@ -272,6 +286,12 @@ def ckeck_wild_ptt(cs, tw, cnt, trea, jsmess):
   global BLK_TMP
   n = 0
   tc = time.time()
+  
+  # Enforce size limit on W_PTT to prevent memory leak
+  if len(W_PTT) >= MAX_W_PTT_ENTRIES:
+    W_PTT = W_PTT[-MAX_W_PTT_ENTRIES//2:]  # Keep only recent half
+    printlog(1, f'W_PTT list trimmed to {len(W_PTT)} entries')
+  
   W_PTT.append([cs, tc])
   for r in W_PTT:
     if (r[1] < (tc - tw)):
@@ -1023,28 +1043,50 @@ def RunServer(config):
     gps_data = []
         
     for s in sock_list:
-      threading.Thread(target=RecvData,args=(s,recvPackets)).start()
+      thread = threading.Thread(target=RecvData,args=(s,recvPackets))
+      thread.daemon = True
+      thread.start()
     
-    threading.Thread(target=ElencoNodi,args=(clients,json_mess)).start()
-    threading.Thread(target=TimeoutNodi,args=(clients,)).start()
-    threading.Thread(target=json_recv,args=(json_mess,sjson,clients_json)).start()
-    threading.Thread(target=json_send,args=(json_mess,sjson,clients_json)).start()
-    threading.Thread(target=TimeoutNodiJS,args=(clients_json,)).start()
-    threading.Thread(target=TimeoutTX,args=(STR, rx_lock_tout, rx_lock, timeout, treactivate, json_mess)).start()
-    threading.Thread(target=scheduler,args=[]).start()
+    thread = threading.Thread(target=ElencoNodi,args=(clients,json_mess))
+    thread.daemon = True
+    thread.start()
+    thread = threading.Thread(target=TimeoutNodi,args=(clients,))
+    thread.daemon = True
+    thread.start()
+    thread = threading.Thread(target=json_recv,args=(json_mess,sjson,clients_json))
+    thread.daemon = True
+    thread.start()
+    thread = threading.Thread(target=json_send,args=(json_mess,sjson,clients_json))
+    thread.daemon = True
+    thread.start()
+    thread = threading.Thread(target=TimeoutNodiJS,args=(clients_json,))
+    thread.daemon = True
+    thread.start()
+    thread = threading.Thread(target=TimeoutTX,args=(STR, rx_lock_tout, rx_lock, timeout, treactivate, json_mess))
+    thread.daemon = True
+    thread.start()
+    thread = threading.Thread(target=scheduler,args=[])
+    thread.daemon = True
+    thread.start()
     if (len(f_blacklist) > 0):
-      threading.Thread(target=blacklist,args=(f_blacklist,tr_blacklist,clients)).start()
+      thread = threading.Thread(target=blacklist,args=(f_blacklist,tr_blacklist,clients))
+      thread.daemon = True
+      thread.start()
     if aprs_en:
-      threading.Thread(target=aprs_send_data,args=(aprs_server, 'YSF' + str(refl_id).zfill(5), aprs_port)).start()
+      thread = threading.Thread(target=aprs_send_data,args=(aprs_server, 'YSF' + str(refl_id).zfill(5), aprs_port))
+      thread.daemon = True
+      thread.start()
     if (len(f_homedb) > 0):
-      threading.Thread(target=homedb,args=(f_homedb,tr_blacklist,clients,dgid_list)).start()
+      thread = threading.Thread(target=homedb,args=(f_homedb,tr_blacklist,clients,dgid_list))
+      thread.daemon = True
+      thread.start()
     
     time_start = time.time()
     
     
-    while True:
+    while not shutdown_requested:
       try:                                       # protection from errors in infinite loop
-            data_ns, addr, sock = recvPackets.get()    # blocked if queue is empty
+            data_ns, addr, sock = recvPackets.get(timeout=1)    # blocked if queue is empty, timeout for shutdown check
             s = sock[0]
             # printlog(1,'Socket ID: ' + str(sock[1]))
             data = sanitize_msg(data_ns)
@@ -1111,10 +1153,14 @@ def RunServer(config):
                   dgid = dgid_default
                   t_hold = 0
                   
-                c=[addr[0], addr[1], (data[4:14]).decode().strip(), 0, id, lonly, time.time(), locked, dgid, t_hold, 0, sock[0], dgid_home, dgid_time, 0]
-                id += 1
-                clients.append(c)
-                printlog(1, 'Adding ' + c[2].ljust(10) + ' (' + c[0] + ':' + str(c[1]) + ') DG-ID ' + str(dgid))
+                # Enforce client limit to prevent memory exhaustion
+                if len(clients) >= MAX_CLIENTS:
+                  printlog(1, f'Maximum clients ({MAX_CLIENTS}) reached, rejecting new connection from {addr[0]}:{addr[1]}')
+                else:
+                  c=[addr[0], addr[1], (data[4:14]).decode().strip(), 0, id, lonly, time.time(), locked, dgid, t_hold, 0, sock[0], dgid_home, dgid_time, 0]
+                  id += 1
+                  clients.append(c)
+                  printlog(1, 'Adding ' + c[2].ljust(10) + ' (' + c[0] + ':' + str(c[1]) + ') DG-ID ' + str(dgid))
               s.sendto(b'YSFPREFLECTOR ',addr)
            
             if (cmd == b'YSFU'):
@@ -1296,6 +1342,12 @@ def RunServer(config):
                         else:  
                           tx[9] = gw_tx[8]
                         lock_tx.release() 
+                        
+                        # Enforce stream limit to prevent memory exhaustion
+                        if len(STR) >= MAX_STREAM_COUNT:
+                          printlog(1, f'Maximum streams ({MAX_STREAM_COUNT}) reached, dropping oldest stream')
+                          STR.pop(0)  # Remove oldest stream
+                        
                         STR.append(tx)
                         if (not hc_ok):
                           printlog(1, '<' + str(tx[5]).zfill(7) + '> Stream opened with invalid HC')  
@@ -1407,10 +1459,17 @@ def RunServer(config):
                   lock_nodi.release()    
                   printlog(1, 'Static DG-ID (' + opt_dg + ') via Options for ' + gw)
     
+      except queue.Empty:
+        # Timeout waiting for data, continue to check shutdown flag
+        continue
       except Exception as e:
         printlog(1, 'Infinite loop error: ' + str(e))        
-                                
-    s.close()
+    
+    # Graceful shutdown
+    printlog(1, 'Shutting down server...')
+    for s in sock_list:
+        s[0].close()
+    sjson.close()
 
 
 def printlog(log_level, mess):
@@ -1475,7 +1534,22 @@ def hex_dump(data):
 
 ######## main ########
 
+# Configuration limits for stability
+MAX_CLIENTS = 1000
+MAX_W_PTT_ENTRIES = 10000
+MAX_STREAM_COUNT = 100
+MAX_SCHEDULED_TASKS = 1000
+MAX_QUEUE_SIZE = 50000
+
+# Global shutdown flag
+shutdown_requested = False
+
 version = '20240210'
+
+def signal_handler(signum, frame):
+    global shutdown_requested
+    printlog(1, f'Received signal {signum}, initiating graceful shutdown...')
+    shutdown_requested = True
 
 if (len(sys.argv) != 2):
   print('Invalid Number of Arguments')
@@ -1530,6 +1604,12 @@ GW_HOME = []
 APRS_STR = queue.Queue()
 lock_tx = threading.Lock()
 lock_nodi = threading.Lock()
+
+# Register signal handlers for graceful shutdown
+signal.signal(signal.SIGTERM, signal_handler)
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGHUP, signal_handler)
+
 RunServer(config)
 
   
