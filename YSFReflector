@@ -1280,7 +1280,12 @@ def RunServer(config):
                   printlog(1, 'Removing ' + c[2].ljust(10) + ' (' + c[0] + ':' + str(c[1]) + ') unlinked')
                   client_manager.remove_client(c)
               
-            if ((cmd == b'YSFD') and (len(data) == 155)):
+            if (cmd == b'YSFD'):
+              # Diagnostic: log unexpected packet sizes for YSFD to aid debugging
+              if len(data) != 155:
+                printlog("d", f'YSFD packet received with unexpected length={len(data)} from {addr[0]}:{addr[1]} socket_dgid={sock[1]}')
+                # Skip processing packets that aren't the expected length
+                continue
               #print(data)                                     
               ba_data = bytearray(data)
               data_mod = bytearray(data) 
@@ -1341,6 +1346,8 @@ def RunServer(config):
                           data_mod[:35] = ba_data[:35]
                           data_mod[35:] = data_p  
                     else:
+                      # If decode failed, log diagnostic info so we can understand why FICH wasn't parsed
+                      printlog("d", f'FICH decode returned False for packet from {addr[0]}:{addr[1]} gw={data[4:14].decode().strip()} src={data[14:24].decode().strip()} len={len(data)} FI={ysffich.getFI()} DT={ysffich.getDT()}')
                       if ((FN == 1) and (DT == 2) and (dgid_prefix > 0)):
                         data_p = ba_data[35:]
                         src = (str(gw_tx[8]) + '/' + tx[15].strip()).ljust(10).encode()
