@@ -537,69 +537,70 @@ def blacklist(f_bl, t_reload, cli):
           printlog(1, 'Reload the Blacklist from File')
           for row in file:
             content = row.strip()
-            
-            # valid line (not a comment)
-            if ((len(content) > 3) and (content[0] != '#')):
-              c_split = content.split(':')
-            for i in range(len(c_split)):
-              c_split[i] = c_split[i].strip()
-              
+
+            # Skip short lines and comments early
+            if not content or len(content) <= 3 or content[0] == '#':
+              continue
+
+            # Split and strip parts for processing
+            c_split = [part.strip() for part in content.split(':')]
+
             # CALL
             if (len(c_split) == 1 or c_split[0] == 'CS'):
               if (len(c_split) == 1):
                 cont = content
               if (c_split[0] == 'CS'):
-                cont = c_split[1] 
+                cont = c_split[1]
               if ((len(cont) <= 8) and (len(cont) >= 3)):
                 if (not inlist(BL_TMP, cont)):
-                  bisect.insort(BL_TMP,cont)
-            
-            # WL      
-            if (len(c_split) == 2 and c_split[0] == 'AL'):      
+                  bisect.insort(BL_TMP, cont)
+
+            # WL
+            if (len(c_split) == 2 and c_split[0] == 'AL'):
               if (not inlist(WL_TMP, c_split[1])):
-                bisect.insort(WL_TMP,c_split[1])
-                  
-            # GW      
-            if (len(c_split) == 2 and c_split[0] == 'GW'):      
+                bisect.insort(WL_TMP, c_split[1])
+
+            # GW
+            if (len(c_split) == 2 and c_split[0] == 'GW'):
               if (not inlist(GW_TMP, c_split[1])):
-                bisect.insort(GW_TMP,c_split[1])
-                
-            # GWB      
-            if (len(c_split) == 2 and c_split[0] == 'GWB'):      
+                bisect.insort(GW_TMP, c_split[1])
+
+            # GWB
+            if (len(c_split) == 2 and c_split[0] == 'GWB'):
               if (not inlist(GW_LK_TMP, c_split[1])):
-                bisect.insort(GW_LK_TMP,c_split[1])              
-           
-           # SUF      
-            if (len(c_split) == 2 and c_split[0] == 'SB'):      
+                bisect.insort(GW_LK_TMP, c_split[1])
+
+            # SUF
+            if (len(c_split) == 2 and c_split[0] == 'SB'):
               if (not inlist(SUF_BL_TMP, c_split[1])):
-                bisect.insort(SUF_BL_TMP,c_split[1])       
-           
-           # SN      
-            if (len(c_split) == 2 and c_split[0] == 'SN' and len(c_split[1]) == 5):      
+                bisect.insort(SUF_BL_TMP, c_split[1])
+
+            # SN
+            if (len(c_split) == 2 and c_split[0] == 'SN' and len(c_split[1]) == 5):
               if (not inlist(SN_BL_TMP, c_split[1])):
-                bisect.insort(SN_BL_TMP,c_split[1])       
-                
-            # IP      
-            if (len(c_split) == 2 and c_split[0] == 'IP'):      
+                bisect.insort(SN_BL_TMP, c_split[1])
+
+            # IP
+            if (len(c_split) == 2 and c_split[0] == 'IP'):
               try:
                 ipa = socket.gethostbyname(c_split[1])
                 ipl = ip2long(ipa)
-              except:
+              except Exception:
                 ipl = 0
                 printlog(2, 'Invalid hostname ' + c_split[1])
-              if (ipl > 0):  
+              if (ipl > 0):
                 if (not inlist(IP_TMP, ipl)):
                   bisect.insort(IP_TMP, ipl)
-            
-             # IPB      
-            if (len(c_split) == 2 and c_split[0] == 'IPB'):      
+
+            # IPB
+            if (len(c_split) == 2 and c_split[0] == 'IPB'):
               try:
                 ipa = socket.gethostbyname(c_split[1])
                 ipl = ip2long(ipa)
-              except:
+              except Exception:
                 ipl = 0
                 printlog(2, 'Invalid hostname ' + c_split[1])
-              if (ipl > 0):  
+              if (ipl > 0):
                 if (not inlist(IP_LK_TMP, ipl)):
                   bisect.insort(IP_LK_TMP, ipl)
                           
@@ -614,10 +615,13 @@ def blacklist(f_bl, t_reload, cli):
       IP_LK = IP_LK_TMP.copy()
       SUF_BL = SUF_BL_TMP.copy()
       SN_BL = SN_BL_TMP.copy()
-      # Sync fast lookup sets with updated lists for O(1) performance
+      # Sync fast lookup sets with updated lists for O(1) performance (only if initialized)
       try:
-        # fast_lookup must be initialized at startup; fail here only logs and continues
-        fast_lookup.sync_from_lists(BLACK_LIST, WHITE_LIST, GW_BL, IP_BL, GW_LK, IP_LK, SUF_BL, SN_BL, BLK_TMP)
+        fl = globals().get('fast_lookup')
+        if fl is not None and hasattr(fl, 'sync_from_lists'):
+          fl.sync_from_lists(BLACK_LIST, WHITE_LIST, GW_BL, IP_BL, GW_LK, IP_LK, SUF_BL, SN_BL, BLK_TMP)
+        else:
+          printlog(2, 'fast_lookup not initialized; skipping sync')
       except Exception as e:
         # If sync fails at runtime, log the error but do not let the blacklist thread crash
         printlog(1, f'Error syncing fast_lookup: {e}')
