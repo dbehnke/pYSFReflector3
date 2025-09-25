@@ -1609,7 +1609,23 @@ def RunServer(config):
                           rx_lock_snapshot = list(rx_lock) if isinstance(rx_lock, (list, set, tuple)) else str(rx_lock)
                         except Exception:
                           rx_lock_snapshot = '<err>'
-                        printlog("d", f'DEBUG DUMP BEFORE SEND: id_corr={current_id_corr} active_streams={active_streams} rx_lock={rx_lock_snapshot} dgid={gw_tx[8]} tx_stream={tx[0]}')
+                        try:
+                          blk_tmp_snapshot = list(BLK_TMP) if isinstance(BLK_TMP, (list, set, tuple)) else str(BLK_TMP)
+                        except Exception:
+                          blk_tmp_snapshot = '<err>'
+                        try:
+                          suf_bl_snapshot = list(SUF_BL) if isinstance(SUF_BL, (list, set, tuple)) else str(SUF_BL)
+                        except Exception:
+                          suf_bl_snapshot = '<err>'
+                        try:
+                          bl_count = len(BLACK_LIST) if isinstance(BLACK_LIST, (list, set, tuple)) else '?'
+                        except Exception:
+                          bl_count = '?'
+                        try:
+                          wl_count = len(WHITE_LIST) if isinstance(WHITE_LIST, (list, set, tuple)) else '?'
+                        except Exception:
+                          wl_count = '?'
+                        printlog("d", f'DEBUG DUMP BEFORE SEND: id_corr={current_id_corr} active_streams={active_streams} rx_lock={rx_lock_snapshot} dgid={gw_tx[8]} tx_stream={tx[0]} BLK_TMP={blk_tmp_snapshot} SUF_BL={suf_bl_snapshot} BL_count={bl_count} WL_count={wl_count}')
 
                       for c in dgid_clients:
                         # Debug info for why a client may be skipped or used
