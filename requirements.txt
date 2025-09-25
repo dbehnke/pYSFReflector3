@@ -1,0 +1,20 @@
+# pYSFReflector3 Requirements
+# Core dependencies for YSF Reflector functionality
+
+# APRS integration
+aprslib>=0.7.0
+
+# Database
+tinydb>=4.8.0
+
+# Memory monitoring (optional but recommended for production)
+psutil>=5.9.0
+
+# Note: The following are Python standard library modules (no pip install needed):
+# - socket, threading, queue, sys, os, time, re, configparser
+# - signal, datetime, bisect, struct, functools, gc
+# - random, json, math
+
+# Local modules (part of this project):
+# - ysffich, ysfpayload, ysfutils, gps, ysfaprs
+# - ysfconvolution, golay24128, crc

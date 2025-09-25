@@ -38,8 +38,18 @@ import ysfpayload
 import ysfutils
 import gps
 import ysfaprs
+from ysfaprs import APRS_LH
 import json
 from tinydb import TinyDB, Query
+import functools
+import gc
+
+# Optional memory monitoring with psutil
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
 
 
 def ip2long(ip):
@@ -105,7 +115,7 @@ def RecvData(sock,recvPackets):
     global shutdown_requested
     while not shutdown_requested:
         try:
-          data,addr = sock[0].recvfrom(2048)    # block if I don't receive anything 
+          data,addr = safe_recvfrom(sock[0], 2048)    # block if I don't receive anything 
           recvPackets.put((data,addr,sock))
         except OSError as e:
           printlog(1, f'Socket error in RecvData: {e}')
@@ -270,6 +280,11 @@ def scheduler():
   while not shutdown_requested:
     time.sleep(1)
     t = time.time()
+    
+    # Periodic memory monitoring (every 60 seconds)
+    if int(t) % 60 == 0:
+      memory_monitor()
+    
     try:
       for sc in SCHED:
         if (t > sc[2]):
@@ -389,8 +404,9 @@ def homedb(f_home, t_reload, cli, dgid_list):
   f_time_old = 0
   try:
     f_time = os.stat(f_home).st_mtime
-  except:
-    pass
+  except (OSError, IOError) as e:
+    printlog(1, f'Failed to get file stats for {f_home}: {e}')
+    f_time = 0
   
   while True:
     f_time = os.stat(f_home).st_mtime
@@ -408,7 +424,8 @@ def homedb(f_home, t_reload, cli, dgid_list):
               try:
                 dgid_int = int(c_split[1])
                 dgid_time = int(c_split[2])
-              except:
+              except (ValueError, IndexError) as e:
+                printlog(1, f'Invalid home database format in line: {content} - {e}')
                 dgid_int = 0
               # valid record  
               if (dgid_time == 0):
@@ -475,22 +492,22 @@ def blacklist(f_bl, t_reload, cli):
     f_time = os.stat(f_bl).st_mtime
     if (f_time != f_time_old):
       try:
-        file = open(f_bl)
-        BL_TMP = []
-        GW_TMP = []
-        IP_TMP = []
-        WL_TMP = []
-        GW_LK_TMP = []
-        IP_LK_TMP = []
-        SUF_BL_TMP = []
-        SN_BL_TMP = []
-        printlog(1, 'Reload the Blacklist from File')
-        for row in file:
-          content = row.strip()
-          
-          # valid line (not a comment)
-          if ((len(content) > 3) and (content[0] != '#')):
-            c_split = content.split(':')
+        with SafeFileHandler(f_bl, 'r') as file:
+          BL_TMP = []
+          GW_TMP = []
+          IP_TMP = []
+          WL_TMP = []
+          GW_LK_TMP = []
+          IP_LK_TMP = []
+          SUF_BL_TMP = []
+          SN_BL_TMP = []
+          printlog(1, 'Reload the Blacklist from File')
+          for row in file:
+            content = row.strip()
+            
+            # valid line (not a comment)
+            if ((len(content) > 3) and (content[0] != '#')):
+              c_split = content.split(':')
             for i in range(len(c_split)):
               c_split[i] = c_split[i].strip()
               
@@ -859,9 +876,11 @@ def json_send(q,s,cl): #queue, socket, clients
       mess = q.get()
       for c in cl:
         # printlog(1, 'send ' + mess + ' at ' + str(c[0]) + ':' + str(c[1])) 
-        s.sendto(str.encode(mess), (c[0], c[1])) 
+        safe_sendto(s, str.encode(mess), (c[0], c[1])) 
+    except (OSError, socket.error) as e:
+      printlog(1, f'Network error in json_send: {e}')
     except Exception as e:
-      printlog(1, 'Error in json_send ' + str(e))        
+      printlog(1, f'Unexpected error in json_send: {e}')        
             
 def json_recv(q,s,cl):
   global version
@@ -878,7 +897,7 @@ def json_recv(q,s,cl):
     
   while True:
     try:
-      data,addr = s.recvfrom(1024)    
+      data,addr = safe_recvfrom(s, 1024)    
       if (data == b'CONNREQ'):
         pres = False
         for c in cl:
@@ -889,12 +908,12 @@ def json_recv(q,s,cl):
           cl.append([addr[0], addr[1], 0])
           printlog(1, 'added json client: ' + str(addr)) 
           connstr = 'CONNOK:' + str(addr[0]) + ':' + str(addr[1]) 
-          s.sendto(str.encode(connstr), addr)
+          safe_sendto(s, str.encode(connstr), addr)
           q.put('{"system": "pYSFReflector3", "ver": "' + version + '", "REF_ID": "' + str(refl_id).zfill(5) + '", "REF_NAME": "' + refl_name + '", "REF_DESC": "' + refl_desc + '", "APRS_EN": "' + str(aprs_en) + '", "APRS_SSID": "' + aprs_ssid + '", "contact": "' + refl_contact + '", "web": "' + refl_web + '", "dgid_loc": "' + str(dgid_local) + '", "dgid_def": "' + str(dgid_default) + '", "dgid_list": "' + str(dgid_list) + '"}')
       if (data == b'PING'):  
         for c in cl:
           if ((c[0] == addr[0]) and (c[1] == addr[1])):
-            s.sendto(b'PONG', addr)
+            safe_sendto(s, b'PONG', addr)
             # printlog(1, 'PING from: ' + str(addr)) 
             c[2] = 0
             break
@@ -903,13 +922,15 @@ def json_recv(q,s,cl):
           if ((c[0] == addr[0]) and (c[1] == addr[1])):
             printlog(1, 'Removing json client ' + c[0] + ':' + str(c[1]) + ' unlinked')
             connstr = 'BYE:' + str(addr[0]) + ':' + str(addr[1]) 
-            s.sendto(str.encode(connstr), addr)
+            safe_sendto(s, str.encode(connstr), addr)
             cl.remove(c)
             break
             
               
+    except (OSError, socket.error) as e:
+      printlog(1, f'Network error in json_recv: {e}')
     except Exception as e:
-      printlog(1, 'Error in json_recv ' + str(e))             
+      printlog(1, f'Unexpected error in json_recv: {e}')             
 
 def dgid_static(gw):
   s = gw.split('-')
@@ -953,6 +974,13 @@ def RunServer(config):
     print('Starting pYSFReflector-' + version)
     printlog(4, 'Starting pYSFReflector-' + version)
     
+    # Log initial memory usage if available
+    initial_memory = get_memory_usage()
+    if initial_memory.get('available', False):
+        printlog(1, f'Initial memory usage: RSS={initial_memory["rss_mb"]:.1f}MB, Percent={initial_memory["percent"]:.1f}%')
+    else:
+        printlog(1, 'Memory monitoring: psutil not available, using basic cleanup only')
+    
     host = config[22]   
     port = config[5]
       
@@ -964,6 +992,8 @@ def RunServer(config):
     for s_i in sock_port:
       s = socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
       s.setblocking(1)
+      s.settimeout(5.0)  # 5 second timeout for network operations
+      s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # Allow address reuse
       s.bind((host,s_i[1]))
       sock_list.append([s, s_i[0]])
       printlog(1,'Add port ' + str(s_i[1]) + ' linked to DG-ID ' + str(s_i[0]))
@@ -976,6 +1006,8 @@ def RunServer(config):
       
     sjson = socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
     sjson.setblocking(1)
+    sjson.settimeout(5.0)  # 5 second timeout for JSON socket
+    sjson.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # Allow address reuse
     sjson.bind((json_host,json_port))
     
     
@@ -1090,6 +1122,9 @@ def RunServer(config):
             s = sock[0]
             # printlog(1,'Socket ID: ' + str(sock[1]))
             data = sanitize_msg(data_ns)
+            
+            # Monitor memory usage periodically
+            memory_monitor()
             cmd = data[0:4]
             
             if debug == 1:
@@ -1161,7 +1196,7 @@ def RunServer(config):
                   id += 1
                   clients.append(c)
                   printlog(1, 'Adding ' + c[2].ljust(10) + ' (' + c[0] + ':' + str(c[1]) + ') DG-ID ' + str(dgid))
-              s.sendto(b'YSFPREFLECTOR ',addr)
+              safe_sendto(s, b'YSFPREFLECTOR ', addr)
            
             if (cmd == b'YSFU'):
               for c in clients:
@@ -1382,12 +1417,14 @@ def RunServer(config):
                            # c[14] = 0
                            # lock_nodi.release()
                             if (c[9] < 0):                        
-                              c[11].sendto(data,(c[0], c[1]))
+                              safe_sendto(c[11], data, (c[0], c[1]))
                             else:
                               #s.sendto(data,(c[0], c[1]))
-                              c[11].sendto((data_mod),(c[0], c[1]))  
-                          except:
-                            printlog(1, 'Error sending data')        
+                              safe_sendto(c[11], data_mod, (c[0], c[1]))  
+                          except (OSError, socket.error) as e:
+                            printlog(1, f'Network error sending data to {c[0]}:{c[1]}: {e}')
+                          except Exception as e:
+                            printlog(1, f'Unexpected error sending data to {c[0]}:{c[1]}: {e}')        
                   
                     if ((FI == 2) and (tx[0] == id_corr) and (tx[0] !=0)):
                       printlog(1, '<' + str(tx[5]).zfill(7) + '> Received end of transmission coords: ' + "{:.6f}".format(tx[7]) + ', ' + "{:.6f}".format(tx[8]))
@@ -1416,7 +1453,7 @@ def RunServer(config):
                 num_cli = len(clients)
               if (sock[1] == 0):    
                 info = 'YSFS' + str(refl_id).zfill(5) + refl_name.ljust(16) + refl_desc.ljust(14) + str(num_cli).zfill(3)
-                s.sendto(str.encode(info),addr)
+                safe_sendto(s, str.encode(info), addr)
               else:
                 r = []
                 for r in REF_ALIAS:
@@ -1424,12 +1461,12 @@ def RunServer(config):
                     break
                 if (r):
                   info = 'YSFS' + str(r[1]).zfill(5) + r[2].ljust(16) + r[3].ljust(14) + str(num_cli).zfill(3)     
-                  s.sendto(str.encode(info),addr)  
+                  safe_sendto(s, str.encode(info), addr)  
                               
             if (cmd == b'YSFV'):
               printlog(0, 'Received command ' + cmd.decode() + ' from: ' + addr[0] + ':' + str(addr[1]))
               info = 'YSFV' + 'pYSFReflector' + ' ' + version
-              s.sendto(str.encode(info),addr)  
+              safe_sendto(s, str.encode(info), addr)  
  
             if (cmd == b'YSFI'):
               # Maybe we can do something usefull with this infos later?
@@ -1545,6 +1582,208 @@ MAX_QUEUE_SIZE = 50000
 shutdown_requested = False
 
 version = '20240210'
+
+# Resource Management Classes for Phase 2
+class SafeFileHandler:
+    """Context manager for safe file operations with automatic cleanup"""
+    def __init__(self, filename, mode='r', encoding='utf-8'):
+        self.filename = filename
+        self.mode = mode
+        self.encoding = encoding
+        self.file = None
+        
+    def __enter__(self):
+        try:
+            self.file = open(self.filename, self.mode, encoding=self.encoding)
+            return self.file
+        except (OSError, IOError) as e:
+            printlog(1, f'Failed to open file {self.filename}: {e}')
+            raise
+            
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.file:
+            try:
+                self.file.flush()
+                self.file.close()
+            except Exception as e:
+                printlog(1, f'Error closing file {self.filename}: {e}')
+        if exc_type:
+            printlog(1, f'Exception in file operation {self.filename}: {exc_type.__name__}: {exc_val}')
+        return False
+
+class SafeSocketHandler:
+    """Context manager for safe socket operations with automatic cleanup"""
+    def __init__(self, family=socket.AF_INET, type=socket.SOCK_DGRAM):
+        self.family = family
+        self.type = type
+        self.socket = None
+        
+    def __enter__(self):
+        try:
+            self.socket = socket.socket(self.family, self.type)
+            return self.socket
+        except OSError as e:
+            printlog(1, f'Failed to create socket: {e}')
+            raise
+            
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.socket:
+            try:
+                self.socket.close()
+            except Exception as e:
+                printlog(1, f'Error closing socket: {e}')
+        if exc_type:
+            printlog(1, f'Exception in socket operation: {exc_type.__name__}: {exc_val}')
+        return False
+
+class SafeDBHandler:
+    """Context manager for TinyDB with automatic cleanup"""
+    def __init__(self, db_path):
+        self.db_path = db_path
+        self.db = None
+        
+    def __enter__(self):
+        try:
+            self.db = TinyDB(self.db_path)
+            return self.db
+        except Exception as e:
+            printlog(1, f'Failed to open database {self.db_path}: {e}')
+            raise
+            
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.db:
+            try:
+                self.db.close()
+            except Exception as e:
+                printlog(1, f'Error closing database {self.db_path}: {e}')
+        if exc_type:
+            printlog(1, f'Exception in database operation: {exc_type.__name__}: {exc_val}')
+        return False
+
+def network_retry(max_retries=3, delay=0.1):
+    """Decorator to retry network operations with exponential backoff"""
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except (OSError, socket.error) as e:
+                    if attempt == max_retries - 1:
+                        printlog(1, f'Network operation {func.__name__} failed after {max_retries} attempts: {e}')
+                        raise
+                    time.sleep(delay * (2 ** attempt))  # Exponential backoff
+            return None
+        return wrapper
+    return decorator
+
+@network_retry(max_retries=3, delay=0.1)
+def safe_sendto(socket_obj, data, address):
+    """Safe sendto operation with retry logic"""
+    return socket_obj.sendto(data, address)
+
+@network_retry(max_retries=3, delay=0.1) 
+def safe_recvfrom(socket_obj, buffer_size):
+    """Safe recvfrom operation with retry logic"""
+    return socket_obj.recvfrom(buffer_size)
+
+def get_memory_usage():
+    """Get current memory usage information"""
+    if not PSUTIL_AVAILABLE:
+        return {
+            'rss_mb': 0.0,
+            'vms_mb': 0.0,
+            'percent': 0.0,
+            'available': False
+        }
+    
+    try:
+        process = psutil.Process()
+        memory_info = process.memory_info()
+        memory_percent = process.memory_percent()
+        return {
+            'rss_mb': memory_info.rss / 1024 / 1024,  # Resident set size in MB
+            'vms_mb': memory_info.vms / 1024 / 1024,  # Virtual memory size in MB  
+            'percent': memory_percent,
+            'available': True
+        }
+    except Exception as e:
+        printlog(1, f'Error getting memory usage: {e}')
+        return {
+            'rss_mb': 0.0,
+            'vms_mb': 0.0,
+            'percent': 0.0,
+            'available': False
+        }
+
+def cleanup_expired_data():
+    """Clean up expired data from global data structures"""
+    global W_PTT, clients, STR, SCHED, APRS_LH
+    current_time = time.time()
+    cleaned_count = 0
+    
+    # Clean expired W_PTT entries (older than 30 seconds)
+    if len(W_PTT) > 0:
+        original_count = len(W_PTT) 
+        W_PTT = [entry for entry in W_PTT if (current_time - entry.get('time', 0)) < 30.0]
+        cleaned_count += original_count - len(W_PTT)
+    
+    # Clean expired client connections (no activity for 300 seconds)
+    if len(clients) > 0:
+        original_count = len(clients)
+        active_clients = []
+        for c in clients:
+            if len(c) > 6 and (current_time - c[6]) < 300.0:  # c[6] is t_conn
+                active_clients.append(c)
+        clients[:] = active_clients
+        cleaned_count += original_count - len(clients)
+    
+    # Clean expired stream data (older than 60 seconds)
+    if len(STR) > 0:
+        original_count = len(STR)
+        active_streams = []
+        for stream in STR:
+            if len(stream) > 6 and (current_time - stream[6]) < 60.0:  # stream[6] is timestamp
+                active_streams.append(stream)
+        STR[:] = active_streams
+        cleaned_count += original_count - len(STR)
+    
+    # Clean old APRS last heard entries (older than 1800 seconds)
+    if len(APRS_LH) > 0:
+        original_count = len(APRS_LH)
+        APRS_LH[:] = [entry for entry in APRS_LH if (current_time - entry[3]) < 1800.0]
+        cleaned_count += original_count - len(APRS_LH)
+    
+    return cleaned_count
+
+def memory_monitor():
+    """Monitor memory usage and trigger cleanup if needed"""
+    memory_info = get_memory_usage()
+    
+    if not memory_info.get('available', False):
+        # If psutil is not available, still run periodic cleanup
+        if int(time.time()) % 300 == 0:  # Every 5 minutes
+            cleaned = cleanup_expired_data()
+            gc.collect()
+            if cleaned > 0:
+                printlog(2, f'Periodic cleanup: removed {cleaned} expired items')
+        return
+    
+    # Log memory usage every 5 minutes
+    if int(time.time()) % 300 == 0:
+        printlog(2, f'Memory usage: RSS={memory_info["rss_mb"]:.1f}MB, Percent={memory_info["percent"]:.1f}%')
+    
+    # Trigger cleanup if memory usage is high
+    if memory_info['percent'] > 75.0 or memory_info['rss_mb'] > 500.0:
+        cleaned = cleanup_expired_data()
+        gc.collect()  # Force garbage collection
+        new_memory = get_memory_usage()
+        printlog(1, f'High memory usage detected ({memory_info["percent"]:.1f}%), cleaned {cleaned} items, '
+                    f'memory reduced from {memory_info["rss_mb"]:.1f}MB to {new_memory["rss_mb"]:.1f}MB')
+        
+        # If memory is still high after cleanup, log a warning
+        if new_memory.get('available', False) and new_memory['percent'] > 85.0:
+            printlog(1, f'WARNING: Memory usage still high after cleanup: {new_memory["percent"]:.1f}%')
 
 def signal_handler(signum, frame):
     global shutdown_requested
