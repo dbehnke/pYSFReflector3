@@ -2181,87 +2181,125 @@ class ClientLookup:
         self.client_map = {}  # addr_port -> client index for fast lookup
         self.dgid_clients = defaultdict(list)  # dgid -> list of client indices
         self.socket_clients = defaultdict(list)  # socket_addr -> list of client indices
-    
+        # Reentrant lock to guard concurrent modifications and lookups
+        self.lock = threading.RLock()
+
     def add_client(self, client):
         """Add client with optimized indexing"""
-        index = len(self.clients)
-        self.clients.append(client)
-        
-        # Create lookup keys
-        addr_key = f"{client[0]}:{client[1]}"
-        if len(client) > 11 and hasattr(client[11], 'getsockname'):
-            socket_key = f"{client[11].getsockname()[0]}:{client[11].getsockname()[1]}"
-            self.socket_clients[socket_key].append(index)
-        
-        self.client_map[addr_key] = index
-        if len(client) > 8:
-            self.dgid_clients[client[8]].append(index)
-        
-        return index
-    
+        with self.lock:
+            index = len(self.clients)
+            self.clients.append(client)
+
+            # Create lookup keys
+            addr_key = f"{client[0]}:{client[1]}"
+            if len(client) > 11 and hasattr(client[11], 'getsockname'):
+                try:
+                    socket_key = f"{client[11].getsockname()[0]}:{client[11].getsockname()[1]}"
+                    self.socket_clients[socket_key].append(index)
+                except Exception:
+                    # Be defensive if getsockname fails
+                    pass
+
+            self.client_map[addr_key] = index
+            if len(client) > 8:
+                self.dgid_clients[client[8]].append(index)
+
+            return index
+
     def find_client(self, addr_ip, addr_port, socket_obj=None):
         """Fast client lookup by address and socket"""
         addr_key = f"{addr_ip}:{addr_port}"
-        client_idx = self.client_map.get(addr_key)
-        
-        if client_idx is None:
-            return None
-            
-        client = self.clients[client_idx]
-        
-        # Verify socket match if provided
-        if socket_obj and len(client) > 11 and hasattr(client[11], 'getsockname'):
-            if (client[11].getsockname()[0] != socket_obj.getsockname()[0] or 
-                client[11].getsockname()[1] != socket_obj.getsockname()[1]):
+        with self.lock:
+            client_idx = self.client_map.get(addr_key)
+
+            if client_idx is None:
                 return None
-        
-        return client
-    
+
+            # Defensive check: index may be stale if another thread modified clients
+            if client_idx < 0 or client_idx >= len(self.clients):
+                # Rebuild indices safely and try again
+                try:
+                    self._rebuild_indices()
+                except Exception:
+                    pass
+
+                client_idx = self.client_map.get(addr_key)
+                if client_idx is None:
+                    return None
+                if client_idx < 0 or client_idx >= len(self.clients):
+                    # Give up and fallback to linear search
+                    for c in self.clients:
+                        if len(c) > 1 and c[0] == addr_ip and c[1] == addr_port:
+                            return c
+                    return None
+
+            client = self.clients[client_idx]
+
+            # Verify socket match if provided
+            if socket_obj and len(client) > 11 and hasattr(client[11], 'getsockname'):
+                try:
+                    if (client[11].getsockname()[0] != socket_obj.getsockname()[0] or 
+                        client[11].getsockname()[1] != socket_obj.getsockname()[1]):
+                        return None
+                except Exception:
+                    # If getsockname fails, be conservative and require direct match via addr
+                    return None
+
+            return client
+
     def remove_client(self, client):
         """Remove client and update indices"""
         try:
-            index = self.clients.index(client)
-            addr_key = f"{client[0]}:{client[1]}"
-            
-            # Remove from maps
-            if addr_key in self.client_map:
-                del self.client_map[addr_key]
-            
-            if len(client) > 8:
-                dgid_list = self.dgid_clients.get(client[8], [])
-                if index in dgid_list:
-                    dgid_list.remove(index)
-            
-            # Remove from socket map
-            if len(client) > 11 and hasattr(client[11], 'getsockname'):
-                socket_key = f"{client[11].getsockname()[0]}:{client[11].getsockname()[1]}"
-                socket_list = self.socket_clients.get(socket_key, [])
-                if index in socket_list:
-                    socket_list.remove(index)
-            
-            # Remove from clients list
-            self.clients.remove(client)
-            self._rebuild_indices()
-            
+            with self.lock:
+                index = self.clients.index(client)
+                addr_key = f"{client[0]}:{client[1]}"
+
+                # Remove from maps
+                if addr_key in self.client_map:
+                    del self.client_map[addr_key]
+
+                if len(client) > 8:
+                    dgid_list = self.dgid_clients.get(client[8], [])
+                    if index in dgid_list:
+                        dgid_list.remove(index)
+
+                # Remove from socket map
+                if len(client) > 11 and hasattr(client[11], 'getsockname'):
+                    try:
+                        socket_key = f"{client[11].getsockname()[0]}:{client[11].getsockname()[1]}"
+                        socket_list = self.socket_clients.get(socket_key, [])
+                        if index in socket_list:
+                            socket_list.remove(index)
+                    except Exception:
+                        pass
+
+                # Remove from clients list
+                self.clients.remove(client)
+                self._rebuild_indices()
+
         except ValueError:
             pass  # Client not in list
-    
+
     def _rebuild_indices(self):
         """Rebuild all indices after removal"""
-        self.client_map.clear()
-        self.dgid_clients.clear() 
-        self.socket_clients.clear()
-        
-        for i, client in enumerate(self.clients):
-            addr_key = f"{client[0]}:{client[1]}"
-            self.client_map[addr_key] = i
-            
-            if len(client) > 8:
-                self.dgid_clients[client[8]].append(i)
-                
-            if len(client) > 11 and hasattr(client[11], 'getsockname'):
-                socket_key = f"{client[11].getsockname()[0]}:{client[11].getsockname()[1]}"
-                self.socket_clients[socket_key].append(i)
+        with self.lock:
+            self.client_map.clear()
+            self.dgid_clients.clear()
+            self.socket_clients.clear()
+
+            for i, client in enumerate(self.clients):
+                addr_key = f"{client[0]}:{client[1]}"
+                self.client_map[addr_key] = i
+
+                if len(client) > 8:
+                    self.dgid_clients[client[8]].append(i)
+
+                if len(client) > 11 and hasattr(client[11], 'getsockname'):
+                    try:
+                        socket_key = f"{client[11].getsockname()[0]}:{client[11].getsockname()[1]}"
+                        self.socket_clients[socket_key].append(i)
+                    except Exception:
+                        pass
     
     def get_clients_by_dgid(self, dgid):
         """Get all clients for a specific DG-ID"""
@@ -2498,6 +2536,9 @@ signal.signal(signal.SIGTERM, signal_handler)
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGHUP, signal_handler)
 
-RunServer(config)
+if __name__ == '__main__':
+  # Only run the server when executed as a script; importing this module for
+  # tests should not start network listeners or threads.
+  RunServer(config)
 
   
