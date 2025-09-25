@@ -43,6 +43,7 @@ import json
 from tinydb import TinyDB, Query
 import functools
 import gc
+from collections import defaultdict
 
 # Optional memory monitoring with psutil
 try:
@@ -95,9 +96,34 @@ def stampa_lista(lista):
 #################################
 
 def inlist(a, x):
+    """Legacy function for sorted list membership - use fast_lookup for performance critical paths"""
     i = bisect.bisect_left(a, x)
     if i != len(a) and a[i] == x:
         return True
+    else:
+        return False
+
+# Performance optimized membership tests using sets
+def fast_inlist(lookup_manager, list_type, item):
+    """Fast O(1) membership test using sets instead of O(log n) binary search"""
+    if list_type == 'BLACK_LIST':
+        return lookup_manager.is_in_black_list(item)
+    elif list_type == 'WHITE_LIST':
+        return lookup_manager.is_in_white_list(item)
+    elif list_type == 'GW_BL':
+        return lookup_manager.is_in_gw_bl(item)
+    elif list_type == 'IP_BL':
+        return lookup_manager.is_in_ip_bl(item)
+    elif list_type == 'GW_LK':
+        return lookup_manager.is_in_gw_lk(item)
+    elif list_type == 'IP_LK':
+        return lookup_manager.is_in_ip_lk(item)
+    elif list_type == 'SUF_BL':
+        return lookup_manager.is_in_suf_bl(item)
+    elif list_type == 'SN_BL':
+        return lookup_manager.is_in_sn_bl(item)
+    elif list_type == 'BLK_TMP':
+        return lookup_manager.is_in_blk_tmp(item)
     else:
         return False        
 
@@ -473,6 +499,7 @@ def homedb(f_home, t_reload, cli, dgid_list):
 
 
 def blacklist(f_bl, t_reload, cli):
+  global fast_lookup  # Add access to global fast lookup manager
   global BLACK_LIST
   global WHITE_LIST
   global GW_BL
@@ -581,6 +608,8 @@ def blacklist(f_bl, t_reload, cli):
       IP_LK = IP_LK_TMP.copy()
       SUF_BL = SUF_BL_TMP.copy()
       SN_BL = SN_BL_TMP.copy()
+      # Sync fast lookup sets with updated lists for O(1) performance
+      fast_lookup.sync_from_lists(BLACK_LIST, WHITE_LIST, GW_BL, IP_BL, GW_LK, IP_LK, SUF_BL, SN_BL, BLK_TMP)
       printlog(1, 'Loaded ' + str(len(BLACK_LIST)) + '/CS ' + str(len(WHITE_LIST)) + '/AL ' + str(len(GW_BL)) + '/GW ' + str(len(IP_BL)) + '/IP ' + str(len(GW_LK)) + '/GWB ' + str(len(IP_LK)) + '/IPB ' + str(len(SUF_BL)) + '/SB ' + str(len(SN_BL)) + '/SN')
       f_time_old = f_time
       update_clients(cli)
@@ -1012,7 +1041,9 @@ def RunServer(config):
     
     
     clients_json = []
-    clients = []   # addr, port, gw, t_corr, ID, lonly, t_conn, locked, DG-ID, T_hold, busy, socket, dg-id_home, time_home, time_home_act
+    # Initialize optimized data structures
+    client_manager = ClientLookup()
+    clients = client_manager.get_all_clients()  # For backward compatibility
     c = []
     rx_lock = []
     rx_lock_tout = {}
@@ -1021,8 +1052,12 @@ def RunServer(config):
     # stream
     tx = [0, 0, '', '', '', 0, 0, 0.0, 0.0, 0, 0, '', '', 0, False,'',0]  # id_gw, tout, gateway, src, dest, id_stream, start_time, lat, long, DG-ID, local, rem12, rem34, radio_code, coord_send, src_clean, stream type
     
-    # list of stream
-    STR = []
+    # Initialize optimized stream management
+    stream_manager = StreamManager()
+    STR = stream_manager.get_all_streams()  # For backward compatibility
+    
+    # Initialize fast lookup manager for blacklists/whitelists
+    fast_lookup = FastLookupManager()
     
     refl_name = config[1][:16]
     refl_desc = config[2][:14]
@@ -1131,25 +1166,24 @@ def RunServer(config):
               hex_dump(data)
 
             if (cmd == b'YSFP'):
-              pres = False
-              for c in clients:
-                if ((c[0] == addr[0]) and (c[1] == addr[1]) and (c[11].getsockname()[0] == s.getsockname()[0]) and (c[11].getsockname()[1] == s.getsockname()[1])):
-                  pres = True
+              # Use optimized client lookup instead of linear search
+              c = client_manager.find_client(addr[0], addr[1], s)
+              pres = c is not None
+              if pres:
                   lock_nodi.acquire()
                   c[3] = 0
                   lock_nodi.release()
-                  break
               if not pres:  
                 lonly = 0
                 locked = 0
-                if inlist(GW_BL, (data[4:14]).decode().strip()):
+                if fast_inlist(fast_lookup, 'GW_BL', (data[4:14]).decode().strip()):
                   lonly = 1
-                if inlist(IP_BL, ip2long(addr[0])):
+                if fast_inlist(fast_lookup, 'IP_BL', ip2long(addr[0])):
                   lonly = 1 
-                if inlist(GW_LK, (data[4:14]).decode().strip()):
+                if fast_inlist(fast_lookup, 'GW_LK', (data[4:14]).decode().strip()):
                   locked = 1
                   lonly = 1
-                if inlist(IP_LK, ip2long(addr[0])):
+                if fast_inlist(fast_lookup, 'IP_LK', ip2long(addr[0])):
                   locked = 1 
                   lonly = 1
                 # new gateway 
@@ -1189,34 +1223,32 @@ def RunServer(config):
                   t_hold = 0
                   
                 # Enforce client limit to prevent memory exhaustion
-                if len(clients) >= MAX_CLIENTS:
+                if len(client_manager) >= MAX_CLIENTS:
                   printlog(1, f'Maximum clients ({MAX_CLIENTS}) reached, rejecting new connection from {addr[0]}:{addr[1]}')
                 else:
                   c=[addr[0], addr[1], (data[4:14]).decode().strip(), 0, id, lonly, time.time(), locked, dgid, t_hold, 0, sock[0], dgid_home, dgid_time, 0]
                   id += 1
-                  clients.append(c)
+                  client_manager.add_client(c)
                   printlog(1, 'Adding ' + c[2].ljust(10) + ' (' + c[0] + ':' + str(c[1]) + ') DG-ID ' + str(dgid))
               safe_sendto(s, b'YSFPREFLECTOR ', addr)
            
             if (cmd == b'YSFU'):
-              for c in clients:
-                if ((c[0] == addr[0]) and (c[1] == addr[1]) and (c[11].getsockname()[0] == s.getsockname()[0]) and (c[11].getsockname()[1] == s.getsockname()[1])):
+              # Use optimized client lookup for removal
+              c = client_manager.find_client(addr[0], addr[1], s)
+              if c:
                   printlog(1, 'Removing ' + c[2].ljust(10) + ' (' + c[0] + ':' + str(c[1]) + ') unlinked')
-                  clients.remove(c)
-                  break
+                  client_manager.remove_client(c)
               
             if ((cmd == b'YSFD') and (len(data) == 155)):
               #print(data)                                     
               ba_data = bytearray(data)
               data_mod = bytearray(data) 
-              gw_tx = []
-              for c in clients:                                 
-                if ((c[0] == addr[0]) and (c[1] == addr[1]) and (c[11].getsockname()[0] == s.getsockname()[0]) and (c[11].getsockname()[1] == s.getsockname()[1])):
-                  gw_tx = c
+              # Use optimized client lookup
+              gw_tx = client_manager.find_client(addr[0], addr[1], s)
+              if gw_tx:
                   lock_nodi.acquire()
                   gw_tx[14] = 0
                   lock_nodi.release()
-                  break
               
               
               if (gw_tx):
@@ -1225,16 +1257,24 @@ def RunServer(config):
                   tx[3] = data[14:24].decode().strip()
                   tx[15] = re.split(r'[-/]', tx[3].strip())[0]
                   dgid_busy = False
-                  for st in STR:
-                    if (st[9] == gw_tx[8]):
+                  # Use optimized stream lookup by DG-ID
+                  dgid_streams = stream_manager.find_streams_by_dgid(gw_tx[8])
+                  if dgid_streams:
                       dgid_busy = True
+                  
+                  # Find specific stream for this gateway
+                  tx_found = None
+                  for st in dgid_streams:
                     if (((st[9] == gw_tx[8]) and (st[0] == gw_tx[4])) or ((gw_tx[8] == dgid_local) and (st[9] == -gw_tx[4])) ):
-                      tx = st
+                      tx_found = st
+                      break
+                  
+                  if tx_found:
+                      tx = tx_found
                       rem12 = tx[11]
                       rem34 = tx[12]
                       radio_code = tx[13]
                       coord_send = tx[14]
-                      break
                       
                   if ysffich.decode(data[40:]): 
                     FI = ysffich.getFI()
@@ -1322,15 +1362,15 @@ def RunServer(config):
                         tx_ok = False
                         block_r = 'DT'
                       else:
-                        if (inlist(GW_BL, gw_corr) or inlist(GW_LK, gw_corr)):
+                        if (fast_inlist(fast_lookup, 'GW_BL', gw_corr) or fast_inlist(fast_lookup, 'GW_LK', gw_corr)):
                           tx_ok = False
                           block_r = 'GW'
                         else:
-                          if (inlist(IP_BL, ip2long(addr[0])) or inlist(IP_LK, ip2long(addr[0]))):
+                          if (fast_inlist(fast_lookup, 'IP_BL', ip2long(addr[0])) or fast_inlist(fast_lookup, 'IP_LK', ip2long(addr[0]))):
                             tx_ok = False
                             block_r = 'IP'      
                           else:
-                            if ((ysffich.getCM() == 1) and (len(ysfpayload.m_dest) == 10) and (ysfpayload.m_dest != '**********') and (inlist(SN_BL, ysfpayload.m_dest[5:10]))):
+                            if ((ysffich.getCM() == 1) and (len(ysfpayload.m_dest) == 10) and (ysfpayload.m_dest != '**********') and (fast_inlist(fast_lookup, 'SN_BL', ysfpayload.m_dest[5:10]))):
                               tx_ok = False
                               block_r = 'SN'
                             else:
@@ -1379,11 +1419,13 @@ def RunServer(config):
                         lock_tx.release() 
                         
                         # Enforce stream limit to prevent memory exhaustion
-                        if len(STR) >= MAX_STREAM_COUNT:
+                        if len(stream_manager) >= MAX_STREAM_COUNT:
                           printlog(1, f'Maximum streams ({MAX_STREAM_COUNT}) reached, dropping oldest stream')
-                          STR.pop(0)  # Remove oldest stream
+                          if stream_manager.streams:  # Remove oldest stream
+                              oldest = stream_manager.streams[0]
+                              stream_manager.remove_stream(oldest)
                         
-                        STR.append(tx)
+                        stream_manager.add_stream(tx)
                         if (not hc_ok):
                           printlog(1, '<' + str(tx[5]).zfill(7) + '> Stream opened with invalid HC')  
                         if ((len(ysfpayload.m_dest) == 0) or (ysfpayload.m_dest == '**********')):  
@@ -1410,8 +1452,10 @@ def RunServer(config):
                       lock_tx.release()
                    
                     if (tx[10] == 0):
-                      for c in clients:
-                        if (((c[0] != addr[0]) or (c[1] != addr[1]) or (c[11].getsockname()[0] != s.getsockname()[0]) or (c[11].getsockname()[1] != s.getsockname()[1])) and (id_corr == tx[0]) and (id_corr != 0) and (id_corr not in rx_lock) and (c[7] == 0) and (c[8] == gw_tx[8])):
+                      # Use optimized DG-ID lookup instead of scanning all clients
+                      dgid_clients = client_manager.get_clients_by_dgid(gw_tx[8])
+                      for c in dgid_clients:
+                        if (((c[0] != addr[0]) or (c[1] != addr[1]) or (c[11].getsockname()[0] != s.getsockname()[0]) or (c[11].getsockname()[1] != s.getsockname()[1])) and (id_corr == tx[0]) and (id_corr != 0) and (id_corr not in rx_lock) and (c[7] == 0)):
                           try:
                            # lock_nodi.acquire()
                            # c[14] = 0
@@ -1428,7 +1472,7 @@ def RunServer(config):
                   
                     if ((FI == 2) and (tx[0] == id_corr) and (tx[0] !=0)):
                       printlog(1, '<' + str(tx[5]).zfill(7) + '> Received end of transmission coords: ' + "{:.6f}".format(tx[7]) + ', ' + "{:.6f}".format(tx[8]))
-                      STR.remove(tx)
+                      stream_manager.remove_stream(tx)
                       if (tx[16] == 1):
                         type_ch = 'TD'
                       else:
@@ -1483,11 +1527,9 @@ def RunServer(config):
                 opt_dg_i = 0
 
               if opt_dg_i in dgid_list:
-                pres = False
-                for c in clients:
-                  if ((c[0] == addr[0]) and (c[1] == addr[1]) and (c[11].getsockname()[0] == s.getsockname()[0]) and (c[11].getsockname()[1] == s.getsockname()[1])):
-                    pres = True
-                    break
+                # Use optimized client lookup
+                c = client_manager.find_client(addr[0], addr[1], s)
+                pres = c is not None
                 if (pres and (c[12] == 0) and (c[9] >= 0)):
                   lock_nodi.acquire()
                   c[12] = opt_dg_i
@@ -1582,6 +1624,9 @@ MAX_QUEUE_SIZE = 50000
 shutdown_requested = False
 
 version = '20240210'
+
+# Global fast lookup manager for optimized performance
+fast_lookup = None
 
 # Resource Management Classes for Phase 2
 class SafeFileHandler:
@@ -1718,7 +1763,7 @@ def get_memory_usage():
 
 def cleanup_expired_data():
     """Clean up expired data from global data structures"""
-    global W_PTT, clients, STR, SCHED, APRS_LH
+    global W_PTT, client_manager, stream_manager, SCHED, APRS_LH
     current_time = time.time()
     cleaned_count = 0
     
@@ -1728,25 +1773,19 @@ def cleanup_expired_data():
         W_PTT = [entry for entry in W_PTT if (current_time - entry.get('time', 0)) < 30.0]
         cleaned_count += original_count - len(W_PTT)
     
-    # Clean expired client connections (no activity for 300 seconds)
-    if len(clients) > 0:
-        original_count = len(clients)
-        active_clients = []
-        for c in clients:
-            if len(c) > 6 and (current_time - c[6]) < 300.0:  # c[6] is t_conn
-                active_clients.append(c)
-        clients[:] = active_clients
-        cleaned_count += original_count - len(clients)
+    # Clean expired client connections using optimized method
+    original_count = len(client_manager)
+    expired_clients = []
+    for c in client_manager.get_all_clients():
+        if len(c) > 6 and (current_time - c[6]) >= 300.0:  # c[6] is t_conn
+            expired_clients.append(c)
     
-    # Clean expired stream data (older than 60 seconds)
-    if len(STR) > 0:
-        original_count = len(STR)
-        active_streams = []
-        for stream in STR:
-            if len(stream) > 6 and (current_time - stream[6]) < 60.0:  # stream[6] is timestamp
-                active_streams.append(stream)
-        STR[:] = active_streams
-        cleaned_count += original_count - len(STR)
+    for c in expired_clients:
+        client_manager.remove_client(c)
+        cleaned_count += 1
+    
+    # Clean expired stream data using optimized method
+    cleaned_count += stream_manager.cleanup_expired(current_time, 60.0)
     
     # Clean old APRS last heard entries (older than 1800 seconds)
     if len(APRS_LH) > 0:
@@ -1784,6 +1823,257 @@ def memory_monitor():
         # If memory is still high after cleanup, log a warning
         if new_memory.get('available', False) and new_memory['percent'] > 85.0:
             printlog(1, f'WARNING: Memory usage still high after cleanup: {new_memory["percent"]:.1f}%')
+
+# Performance optimization data structures
+class ClientLookup:
+    """Optimized client lookup using hash maps for O(1) performance"""
+    def __init__(self):
+        self.clients = []  # Keep original list for compatibility
+        self.client_map = {}  # addr_port -> client index for fast lookup
+        self.dgid_clients = defaultdict(list)  # dgid -> list of client indices
+        self.socket_clients = defaultdict(list)  # socket_addr -> list of client indices
+    
+    def add_client(self, client):
+        """Add client with optimized indexing"""
+        index = len(self.clients)
+        self.clients.append(client)
+        
+        # Create lookup keys
+        addr_key = f"{client[0]}:{client[1]}"
+        if len(client) > 11 and hasattr(client[11], 'getsockname'):
+            socket_key = f"{client[11].getsockname()[0]}:{client[11].getsockname()[1]}"
+            self.socket_clients[socket_key].append(index)
+        
+        self.client_map[addr_key] = index
+        if len(client) > 8:
+            self.dgid_clients[client[8]].append(index)
+        
+        return index
+    
+    def find_client(self, addr_ip, addr_port, socket_obj=None):
+        """Fast client lookup by address and socket"""
+        addr_key = f"{addr_ip}:{addr_port}"
+        client_idx = self.client_map.get(addr_key)
+        
+        if client_idx is None:
+            return None
+            
+        client = self.clients[client_idx]
+        
+        # Verify socket match if provided
+        if socket_obj and len(client) > 11 and hasattr(client[11], 'getsockname'):
+            if (client[11].getsockname()[0] != socket_obj.getsockname()[0] or 
+                client[11].getsockname()[1] != socket_obj.getsockname()[1]):
+                return None
+        
+        return client
+    
+    def remove_client(self, client):
+        """Remove client and update indices"""
+        try:
+            index = self.clients.index(client)
+            addr_key = f"{client[0]}:{client[1]}"
+            
+            # Remove from maps
+            if addr_key in self.client_map:
+                del self.client_map[addr_key]
+            
+            if len(client) > 8:
+                dgid_list = self.dgid_clients.get(client[8], [])
+                if index in dgid_list:
+                    dgid_list.remove(index)
+            
+            # Remove from socket map
+            if len(client) > 11 and hasattr(client[11], 'getsockname'):
+                socket_key = f"{client[11].getsockname()[0]}:{client[11].getsockname()[1]}"
+                socket_list = self.socket_clients.get(socket_key, [])
+                if index in socket_list:
+                    socket_list.remove(index)
+            
+            # Remove from clients list
+            self.clients.remove(client)
+            self._rebuild_indices()
+            
+        except ValueError:
+            pass  # Client not in list
+    
+    def _rebuild_indices(self):
+        """Rebuild all indices after removal"""
+        self.client_map.clear()
+        self.dgid_clients.clear() 
+        self.socket_clients.clear()
+        
+        for i, client in enumerate(self.clients):
+            addr_key = f"{client[0]}:{client[1]}"
+            self.client_map[addr_key] = i
+            
+            if len(client) > 8:
+                self.dgid_clients[client[8]].append(i)
+                
+            if len(client) > 11 and hasattr(client[11], 'getsockname'):
+                socket_key = f"{client[11].getsockname()[0]}:{client[11].getsockname()[1]}"
+                self.socket_clients[socket_key].append(i)
+    
+    def get_clients_by_dgid(self, dgid):
+        """Get all clients for a specific DG-ID"""
+        indices = self.dgid_clients.get(dgid, [])
+        return [self.clients[i] for i in indices if i < len(self.clients)]
+    
+    def get_all_clients(self):
+        """Get all clients (for backward compatibility)"""
+        return self.clients
+    
+    def __len__(self):
+        return len(self.clients)
+
+class StreamManager:
+    """Optimized stream management with hash-based lookups"""
+    def __init__(self):
+        self.streams = []  # Keep original list for compatibility
+        self.stream_by_id = {}  # stream_id -> stream
+        self.stream_by_dgid = defaultdict(list)  # dgid -> list of streams
+    
+    def add_stream(self, stream):
+        """Add stream with optimized indexing"""
+        self.streams.append(stream)
+        if len(stream) > 0:
+            self.stream_by_id[stream[0]] = stream
+        if len(stream) > 9:
+            self.stream_by_dgid[stream[9]].append(stream)
+    
+    def find_stream_by_id(self, stream_id):
+        """Fast stream lookup by ID"""
+        return self.stream_by_id.get(stream_id)
+    
+    def find_streams_by_dgid(self, dgid):
+        """Get all streams for a specific DG-ID"""
+        return self.stream_by_dgid.get(dgid, [])
+    
+    def remove_stream(self, stream):
+        """Remove stream and update indices"""
+        try:
+            self.streams.remove(stream)
+            
+            if len(stream) > 0 and stream[0] in self.stream_by_id:
+                del self.stream_by_id[stream[0]]
+            
+            if len(stream) > 9:
+                dgid_streams = self.stream_by_dgid.get(stream[9], [])
+                if stream in dgid_streams:
+                    dgid_streams.remove(stream)
+                    
+        except ValueError:
+            pass  # Stream not in list
+    
+    def get_all_streams(self):
+        """Get all streams (for backward compatibility)"""
+        return self.streams
+    
+    def cleanup_expired(self, current_time, max_age=60.0):
+        """Remove expired streams efficiently"""
+        active_streams = []
+        removed_count = 0
+        
+        for stream in self.streams:
+            if len(stream) > 6 and (current_time - stream[6]) < max_age:
+                active_streams.append(stream)
+            else:
+                removed_count += 1
+                # Clean up indices
+                if len(stream) > 0 and stream[0] in self.stream_by_id:
+                    del self.stream_by_id[stream[0]]
+                if len(stream) > 9:
+                    dgid_streams = self.stream_by_dgid.get(stream[9], [])
+                    if stream in dgid_streams:
+                        dgid_streams.remove(stream)
+        
+        self.streams = active_streams
+        return removed_count
+    
+    def __len__(self):
+        return len(self.streams)
+
+class FastLookupManager:
+    """Manages fast set-based lookups for blacklists and whitelists"""
+    def __init__(self):
+        # Convert sorted lists to sets for O(1) lookup
+        self.black_list_set = set()
+        self.white_list_set = set()
+        self.gw_bl_set = set()
+        self.ip_bl_set = set()
+        self.gw_lk_set = set()
+        self.ip_lk_set = set()
+        self.suf_bl_set = set()
+        self.sn_bl_set = set()
+        self.blk_tmp_set = set()
+        
+        # Keep track of which lists need updating
+        self._needs_sync = True
+    
+    def sync_from_lists(self, black_list, white_list, gw_bl, ip_bl, gw_lk, ip_lk, suf_bl, sn_bl, blk_tmp):
+        """Sync sets from sorted lists for fast lookups"""
+        self.black_list_set = set(black_list)
+        self.white_list_set = set(white_list)
+        self.gw_bl_set = set(gw_bl)
+        self.ip_bl_set = set(ip_bl)
+        self.gw_lk_set = set(gw_lk)
+        self.ip_lk_set = set(ip_lk)
+        self.suf_bl_set = set(suf_bl)
+        self.sn_bl_set = set(sn_bl)
+        self.blk_tmp_set = set(blk_tmp)
+        self._needs_sync = False
+    
+    def is_in_black_list(self, item):
+        """Fast blacklist lookup - O(1) instead of O(log n)"""
+        return item in self.black_list_set
+    
+    def is_in_white_list(self, item):
+        """Fast whitelist lookup - O(1) instead of O(log n)"""
+        return item in self.white_list_set
+    
+    def is_in_gw_bl(self, item):
+        """Fast gateway blacklist lookup - O(1) instead of O(log n)"""
+        return item in self.gw_bl_set
+    
+    def is_in_ip_bl(self, item):
+        """Fast IP blacklist lookup - O(1) instead of O(log n)"""
+        return item in self.ip_bl_set
+    
+    def is_in_gw_lk(self, item):
+        """Fast gateway lock lookup - O(1) instead of O(log n)"""
+        return item in self.gw_lk_set
+    
+    def is_in_ip_lk(self, item):
+        """Fast IP lock lookup - O(1) instead of O(log n)"""
+        return item in self.ip_lk_set
+    
+    def is_in_suf_bl(self, item):
+        """Fast suffix blacklist lookup - O(1) instead of O(log n)"""
+        return item in self.suf_bl_set
+    
+    def is_in_sn_bl(self, item):
+        """Fast serial number blacklist lookup - O(1) instead of O(log n)"""
+        return item in self.sn_bl_set
+    
+    def is_in_blk_tmp(self, item):
+        """Fast temporary block lookup - O(1) instead of O(log n)"""
+        return item in self.blk_tmp_set
+    
+    def add_to_blk_tmp(self, item):
+        """Add item to temporary block set"""
+        self.blk_tmp_set.add(item)
+    
+    def remove_from_blk_tmp(self, item):
+        """Remove item from temporary block set"""
+        self.blk_tmp_set.discard(item)
+    
+    def mark_for_sync(self):
+        """Mark that sets need to be re-synced from lists"""
+        self._needs_sync = True
+    
+    def needs_sync(self):
+        """Check if sync is needed"""
+        return self._needs_sync
 
 def signal_handler(signum, frame):
     global shutdown_requested
