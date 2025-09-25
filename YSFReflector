@@ -1469,8 +1469,13 @@ def RunServer(config):
                     else:
                       if (id_corr not in rx_lock):
                         rx_lock.append(id_corr)  
-                        printlog(1, 'Data from ' + data[14:24].decode().strip().ljust(10) + ' at ' + data[4:14].decode().strip().ljust(10) + ' blocked/' + block_r)
-                        json_mess.put('{"blocked": "-1", "CS": "' + data[14:24].decode().strip().ljust(10) + '", "GW": "' + data[4:14].decode().strip().ljust(10) + '", "BR": "' +  block_r +'", "time": "' + str(datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S.%f'))[:-3] + '"}')
+                        # Include stream id and DG-ID (if available) in logs to diagnose rx_lock reasons
+                        try:
+                          dgid_info = str(tx[9]) if 'tx' in locals() and isinstance(tx, (list, tuple)) and len(tx) > 9 else (str(gw_tx[8]) if 'gw_tx' in locals() and len(gw_tx) > 8 else '?')
+                        except Exception:
+                          dgid_info = '?'
+                        printlog(1, 'Data from ' + data[14:24].decode().strip().ljust(10) + ' at ' + data[4:14].decode().strip().ljust(10) + ' blocked/' + block_r + ' stream_id=' + str(id_corr) + ' dgid=' + dgid_info)
+                        json_mess.put('{"blocked": "-1", "CS": "' + data[14:24].decode().strip().ljust(10) + '", "GW": "' + data[4:14].decode().strip().ljust(10) + '", "BR": "' +  block_r + '", "stream_id": "' + str(id_corr) + '", "dgid": "' + dgid_info + '", "time": "' + str(datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S.%f'))[:-3] + '"}')
                       rx_lock_tout[id_corr] = 0  
                     
                     if ((id_corr == tx[0]) and (id_corr != 0)):    
