@@ -301,8 +301,12 @@ def TimeoutTX(stream, t_lock, r_lock, t_out, t_react, jsmess):
          r_lock.remove(d)
         
    for x in pop_list:
-     t_lock.pop(x)   
-     printlog(1, 'Removed from blockeds queue ' + str(x))
+     t_lock.pop(x)
+     try:
+       ts = str(datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S.%f'))[:-3]
+     except Exception:
+       ts = str(time.time())
+     printlog(1, f'Removed from blockeds queue {x} at {ts}')
    time.sleep(0.1)  
 
 def scheduler():
