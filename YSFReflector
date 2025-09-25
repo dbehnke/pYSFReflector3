@@ -138,9 +138,16 @@ def check_string(l):
 
 def RecvData(sock,recvPackets):
     global shutdown_requested
+    global last_recv_by_fd
     while not shutdown_requested:
         try:
           data,addr = safe_recvfrom(sock[0], 2048)    # block if I don't receive anything 
+          # Record last remote address seen on this socket fileno so timeout logs can be enriched
+          try:
+            fd = sock[0].fileno()
+            last_recv_by_fd[fd] = addr
+          except Exception:
+            pass
           recvPackets.put((data,addr,sock))
         except OSError as e:
           printlog(1, f'Socket error in RecvData: {e}')
@@ -1475,16 +1482,52 @@ def RunServer(config):
                       # Use optimized DG-ID lookup instead of scanning all clients
                       dgid_clients = client_manager.get_clients_by_dgid(gw_tx[8])
                       for c in dgid_clients:
-                        if (((c[0] != addr[0]) or (c[1] != addr[1]) or (c[11].getsockname()[0] != s.getsockname()[0]) or (c[11].getsockname()[1] != s.getsockname()[1])) and (id_corr == tx[0]) and (id_corr != 0) and (id_corr not in rx_lock) and (c[7] == 0)):
+                        # Debug info for why a client may be skipped or used
+                        try:
+                          candidate_ip = c[0]
+                          candidate_port = c[1]
+                          candidate_sock = c[11] if len(c) > 11 else None
+                          candidate_callsign = c[2] if len(c) > 2 else '<no-call>'
+                        except Exception:
+                          candidate_ip = '<err>'
+                          candidate_port = 0
+                          candidate_sock = None
+                          candidate_callsign = '<err>'
+
+                        skip_reasons = []
+                        # Evaluate skip conditions and record reasons
+                        if (candidate_ip == addr[0] and candidate_port == addr[1]):
+                          skip_reasons.append('same-src')
+                        if (candidate_sock is None or not hasattr(candidate_sock, 'getsockname')):
+                          skip_reasons.append('no-sock')
+                        else:
                           try:
-                           # lock_nodi.acquire()
-                           # c[14] = 0
-                           # lock_nodi.release()
+                            if (candidate_sock.getsockname()[0] != s.getsockname()[0] or candidate_sock.getsockname()[1] != s.getsockname()[1]):
+                              skip_reasons.append('different-socket')
+                          except Exception:
+                            skip_reasons.append('sock-getname-err')
+                        if (id_corr != tx[0] or id_corr == 0):
+                          skip_reasons.append('id-mismatch')
+                        if (id_corr in rx_lock):
+                          skip_reasons.append('rx-locked')
+                        if (c[7] != 0):
+                          skip_reasons.append('muted')
+
+                        if debug == 1:
+                          printlog("d", f'Candidate for send: {candidate_callsign} {candidate_ip}:{candidate_port} checks skip_reasons={skip_reasons}')
+
+                        if (((candidate_ip != addr[0]) or (candidate_port != addr[1]) or (not skip_reasons)) and (id_corr == tx[0]) and (id_corr != 0) and (id_corr not in rx_lock) and (c[7] == 0)):
+                          try:
+                            # lock_nodi.acquire()
+                            # c[14] = 0
+                            # lock_nodi.release()
                             if (c[9] < 0):                        
                               safe_sendto(c[11], data, (c[0], c[1]))
                             else:
                               #s.sendto(data,(c[0], c[1]))
                               safe_sendto(c[11], data_mod, (c[0], c[1]))  
+                            if debug == 1:
+                              printlog("d", f'Sent to {candidate_callsign} {candidate_ip}:{candidate_port}')
                           except (OSError, socket.error) as e:
                             printlog(1, f'Network error sending data to {c[0]}:{c[1]}: {e}')
                           except Exception as e:
@@ -1562,7 +1605,36 @@ def RunServer(config):
         # Timeout waiting for data, continue to check shutdown flag
         continue
       except Exception as e:
-        printlog(1, 'Infinite loop error: ' + str(e))        
+        # Provide richer context for debugging: include traceback and relevant loop state
+        try:
+          import traceback as _tb
+          tb = _tb.format_exc()
+        except Exception:
+          tb = 'Unable to capture traceback'
+
+        # Collect some local context where possible
+        try:
+          cmd_repr = cmd.decode(errors='ignore') if 'cmd' in locals() and isinstance(cmd, (bytes, bytearray)) else str(globals().get('cmd', ''))
+        except Exception:
+          cmd_repr = '<unknown>'
+        try:
+          addr_repr = f'{addr[0]}:{addr[1]}' if 'addr' in locals() and addr else '<no addr>'
+        except Exception:
+          addr_repr = '<no addr>'
+        try:
+          sock_repr = '?'
+          if 'sock' in locals() and sock and hasattr(sock[0], 'getsockname'):
+            sock_repr = str(sock[0].getsockname())
+        except Exception:
+          sock_repr = '?'
+
+        try:
+          data_len = len(data_ns) if 'data_ns' in locals() and data_ns is not None else (len(data) if 'data' in locals() and data is not None else -1)
+        except Exception:
+          data_len = -1
+
+        printlog(1, f'Infinite loop error: {e} ; cmd={cmd_repr} ; addr={addr_repr} ; sock={sock_repr} ; data_len={data_len} ; clients={len(client_manager) if globals().get("client_manager") else "?"}')
+        printlog(1, tb)
     
     # Graceful shutdown
     printlog(1, 'Shutting down server...')
@@ -1647,6 +1719,8 @@ version = '20240210'
 
 # Global fast lookup manager for optimized performance
 fast_lookup = None
+# Track last remote addr seen per socket fileno to provide context on recv timeouts
+last_recv_by_fd = {}
 
 # Resource Management Classes for Phase 2
 class SafeFileHandler:
@@ -1734,9 +1808,61 @@ def network_retry(max_retries=3, delay=0.1):
                 try:
                     return func(*args, **kwargs)
                 except (OSError, socket.error) as e:
+                    # Log each retry at debug level to avoid noisy INFO logs for expected transient errors
+                    try:
+                        printlog("d", f'Network operation {func.__name__} attempt {attempt+1}/{max_retries} failed: {e}')
+                    except Exception:
+                        pass
+
+                    # If this is a socket.timeout, keep it quieter (debug) and still retry — final timeout won't log at INFO
                     if attempt == max_retries - 1:
-                        printlog(1, f'Network operation {func.__name__} failed after {max_retries} attempts: {e}')
-                        raise
+                        if isinstance(e, socket.timeout):
+                            # Try to enrich timeout message with last seen remote address and callsign (if available)
+                            extra_msg = ''
+                            sock_obj = None
+                            try:
+                                if len(args) > 0:
+                                    sock_obj = args[0]
+                                if sock_obj and hasattr(sock_obj, 'fileno'):
+                                    fd = sock_obj.fileno()
+                                    last_map = globals().get('last_recv_by_fd', {})
+                                    last = last_map.get(fd)
+                                    if last:
+                                        last_ip, last_port = last[0], last[1]
+                                        cm = globals().get('client_manager')
+                                        callsign = None
+                                        try:
+                                            if cm:
+                                                client = cm.find_client(last_ip, last_port, sock_obj)
+                                                if client and len(client) > 2:
+                                                    callsign = client[2]
+                                        except Exception:
+                                            callsign = None
+                                        if callsign:
+                                            extra_msg = f' Last seen from {last_ip}:{last_port} callsign={callsign}'
+                                        else:
+                                            extra_msg = f' Last seen from {last_ip}:{last_port}'
+                            except Exception:
+                                extra_msg = ''
+
+                            try:
+                                if extra_msg:
+                                    # If we have context about a last-seen remote, log at INFO so operator notices
+                                    sock_name = ''
+                                    try:
+                                        sock_name = str(sock_obj.getsockname())
+                                    except Exception:
+                                        sock_name = '?'
+                                    printlog(1, f'Network operation {func.__name__} timed out after {max_retries} attempts on socket {sock_name}.{extra_msg}')
+                                else:
+                                    printlog("d", f'Network operation {func.__name__} timed out after {max_retries} attempts')
+                            except Exception:
+                                pass
+                            raise
+                        else:
+                            printlog(1, f'Network operation {func.__name__} failed after {max_retries} attempts: {e}')
+                            raise
+
                     time.sleep(delay * (2 ** attempt))  # Exponential backoff
             return None
         return wrapper
@@ -1783,36 +1909,67 @@ def get_memory_usage():
 
 def cleanup_expired_data():
     """Clean up expired data from global data structures"""
-    global W_PTT, client_manager, stream_manager, SCHED, APRS_LH
+    # Be defensive: some globals (client_manager, stream_manager) are created at runtime inside RunServer.
+    global W_PTT, SCHED
     current_time = time.time()
     cleaned_count = 0
-    
+
     # Clean expired W_PTT entries (older than 30 seconds)
-    if len(W_PTT) > 0:
-        original_count = len(W_PTT) 
-        W_PTT = [entry for entry in W_PTT if (current_time - entry.get('time', 0)) < 30.0]
-        cleaned_count += original_count - len(W_PTT)
-    
-    # Clean expired client connections using optimized method
-    original_count = len(client_manager)
-    expired_clients = []
-    for c in client_manager.get_all_clients():
-        if len(c) > 6 and (current_time - c[6]) >= 300.0:  # c[6] is t_conn
-            expired_clients.append(c)
-    
-    for c in expired_clients:
-        client_manager.remove_client(c)
-        cleaned_count += 1
-    
-    # Clean expired stream data using optimized method
-    cleaned_count += stream_manager.cleanup_expired(current_time, 60.0)
-    
-    # Clean old APRS last heard entries (older than 1800 seconds)
-    if len(APRS_LH) > 0:
-        original_count = len(APRS_LH)
-        APRS_LH[:] = [entry for entry in APRS_LH if (current_time - entry[3]) < 1800.0]
-        cleaned_count += original_count - len(APRS_LH)
-    
+    try:
+        if len(W_PTT) > 0:
+            original_count = len(W_PTT)
+            new_wptt = []
+            for entry in W_PTT:
+                # Support both legacy list form [call, ts] and dict form {'time': ts}
+                try:
+                    t = entry.get('time') if isinstance(entry, dict) else entry[1]
+                except Exception:
+                    t = 0
+                if (current_time - t) < 30.0:
+                    new_wptt.append(entry)
+            W_PTT[:] = new_wptt
+            cleaned_count += original_count - len(W_PTT)
+    except Exception as e:
+        printlog(1, f'Error cleaning W_PTT: {e}')
+
+    # Clean expired client connections using optimized method if available
+    try:
+        cm = globals().get('client_manager')
+        if cm is not None:
+            expired_clients = []
+            for c in cm.get_all_clients():
+                if len(c) > 6 and (current_time - c[6]) >= 300.0:  # c[6] is t_conn
+                    expired_clients.append(c)
+            for c in expired_clients:
+                try:
+                    cm.remove_client(c)
+                    cleaned_count += 1
+                except Exception as e:
+                    printlog(1, f'Error removing expired client: {e}')
+    except Exception as e:
+        printlog(1, f'Error during client cleanup: {e}')
+
+    # Clean expired stream data using optimized method if available
+    try:
+        sm = globals().get('stream_manager')
+        if sm is not None:
+            cleaned_count += sm.cleanup_expired(current_time, 60.0)
+    except Exception as e:
+        printlog(1, f'Error during stream cleanup: {e}')
+
+    # Clean old APRS last heard entries (older than 1800 seconds) if APRS_LH is present
+    try:
+        if 'APRS_LH' in globals() and len(APRS_LH) > 0:
+            original_count = len(APRS_LH)
+            try:
+                APRS_LH[:] = [entry for entry in APRS_LH if (current_time - (entry[3] if isinstance(entry, (list, tuple)) and len(entry) > 3 else entry.get('time', 0))) < 1800.0]
+            except Exception:
+                # Fallback: try a safer filter assuming list entries with index 3
+                APRS_LH[:] = [entry for entry in APRS_LH if (isinstance(entry, (list, tuple)) and len(entry) > 3 and (current_time - entry[3]) < 1800.0)]
+            cleaned_count += original_count - len(APRS_LH)
+    except Exception as e:
+        printlog(1, f'Error cleaning APRS_LH: {e}')
+
     return cleaned_count
 
 def memory_monitor():
