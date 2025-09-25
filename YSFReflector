@@ -1500,6 +1500,47 @@ def RunServer(config):
                     if (tx[10] == 0):
                       # Use optimized DG-ID lookup instead of scanning all clients
                       dgid_clients = client_manager.get_clients_by_dgid(gw_tx[8])
+                      # Debug dump: show id_corr, active stream ids, and rx_lock snapshot to diagnose forwarding blocks
+                      if debug == 1:
+                        try:
+                          # id_corr may be local to outer scope; capture safely
+                          current_id_corr = id_corr if 'id_corr' in locals() else (tx[0] if isinstance(tx, (list, tuple)) and len(tx) > 0 else 0)
+                        except Exception:
+                          current_id_corr = '?'
+                        try:
+                          # Build a compact list of active stream ids from stream_manager
+                          active_streams = []
+                          # stream_manager may provide a public list or iterator; attempt common access patterns
+                          if hasattr(stream_manager, 'streams'):
+                            for srec in getattr(stream_manager, 'streams'):
+                              try:
+                                active_streams.append(srec[0])
+                              except Exception:
+                                pass
+                          elif hasattr(stream_manager, 'list'):
+                            for srec in getattr(stream_manager, 'list'):
+                              try:
+                                active_streams.append(srec[0])
+                              except Exception:
+                                pass
+                          else:
+                            # Fallback: try iterating if it's list-like
+                            try:
+                              for srec in stream_manager:
+                                try:
+                                  active_streams.append(srec[0])
+                                except Exception:
+                                  pass
+                            except Exception:
+                              active_streams = ['<unknown>']
+                        except Exception:
+                          active_streams = ['<err>']
+                        try:
+                          rx_lock_snapshot = list(rx_lock) if isinstance(rx_lock, (list, set, tuple)) else str(rx_lock)
+                        except Exception:
+                          rx_lock_snapshot = '<err>'
+                        printlog("d", f'DEBUG DUMP BEFORE SEND: id_corr={current_id_corr} active_streams={active_streams} rx_lock={rx_lock_snapshot} dgid={gw_tx[8]} tx_stream={tx[0]}')
+
                       for c in dgid_clients:
                         # Debug info for why a client may be skipped or used
                         try:
