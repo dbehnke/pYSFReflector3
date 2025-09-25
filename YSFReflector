@@ -398,6 +398,17 @@ def canTrasmit(cs, re_en):
     if inlist(WHITE_LIST, call):
       return True
     return False
+    # Debug: log call and regex mode
+    try:
+      if globals().get('debug', 0) == 1:
+        in_black = inlist(BLACK_LIST, call)
+        in_white = inlist(WHITE_LIST, call)
+        in_suf = False
+        if len(call_sp) > 1:
+          in_suf = inlist(SUF_BL, call_sp[1])
+        printlog('d', f'canTrasmit: call={call} re_en={re_en} in_black={in_black} in_white={in_white} suf_block={in_suf}')
+    except Exception:
+      pass
     
     
 def lista_gw(cl):
