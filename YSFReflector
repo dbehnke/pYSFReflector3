@@ -361,22 +361,36 @@ def canTrasmit(cs, re_en):
   global BLK_TMP
   global SUF_BL
 
-  call_sp = re.split(r'[-/\' \']', cs)
+  call_sp = re.split(r"[-/\' ]", cs)
   call = call_sp[0]
+  # Detailed debug: show normalized call and split parts when debug enabled
+  try:
+    if debug == 1:
+      printlog("d", f'canTrasmit: raw_cs="{cs}" call="{call}" call_sp={call_sp} re_en={re_en}')
+  except Exception:
+    pass
   
 ## always block a stream from repeater/node/gateway ###
   if (len(call_sp) > 1):
     if inlist(SUF_BL, call_sp[1]):
+      if debug == 1:
+        printlog("d", f'canTrasmit: blocked by SUF_BL suffix {call_sp[1]} for call {call}')
       return False      
   
   if inlist(BLK_TMP, call):
+    if debug == 1:
+      printlog("d", f'canTrasmit: blocked by BLK_TMP for call {call}')
     return False
       
 ## case CheckRE == 1 ###
   if (re_en == 1):  
     if inlist(WHITE_LIST, call):
+      if debug == 1:
+        printlog("d", f'canTrasmit: allowed by WHITE_LIST for call {call}')
       return True
     if inlist(BLACK_LIST, call):
+      if debug == 1:
+        printlog("d", f'canTrasmit: blocked by BLACK_LIST for call {call}')
       return False
     if (re.match(r'^\d?[A-Z]{1,2}\d{1,4}[A-Z]{1,3}$',call,re.IGNORECASE) and (len(call) <= 8)):
       return True
@@ -386,16 +400,24 @@ def canTrasmit(cs, re_en):
 ## case CheckRE == 0 ###
   if (re_en == 0):  
     if inlist(WHITE_LIST, call):
+      if debug == 1:
+        printlog("d", f'canTrasmit: allowed by WHITE_LIST for call {call} (CheckRE=0)')
       return True
     if inlist(BLACK_LIST, call):
+      if debug == 1:
+        printlog("d", f'canTrasmit: blocked by BLACK_LIST for call {call} (CheckRE=0)')
       return False
     return True
 
 ## case CheckRE == -1 ###
   if (re_en == -1):  
     if inlist(BLACK_LIST, call):
+      if debug == 1:
+        printlog("d", f'canTrasmit: blocked by BLACK_LIST for call {call} (CheckRE=-1)')
       return False
     if inlist(WHITE_LIST, call):
+      if debug == 1:
+        printlog("d", f'canTrasmit: allowed by WHITE_LIST for call {call} (CheckRE=-1)')
       return True
     return False
     
