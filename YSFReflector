@@ -2292,8 +2292,18 @@ try:
   else:
     filelog = open(log_file,'x')
 except Exception as e:
-  print('Unable to Open Log File: ' + str(e))
-  sys.exit()
+  # In containerized environments the configured path may not exist or be writable.
+  # Fall back to stdout so docker logs and consoles still see runtime logs instead of exiting.
+  try:
+    print(f'WARNING: Unable to open configured log file "{log_file}": {e}. Falling back to stdout for logging.')
+  except Exception:
+    pass
+  try:
+    filelog = sys.stdout
+  except Exception:
+    # As a last resort, give up and exit (very unlikely)
+    print('FATAL: Cannot open log file and cannot fall back to stdout')
+    sys.exit(1)
   
 BLACK_LIST = [] 
 WHITE_LIST = [] 
