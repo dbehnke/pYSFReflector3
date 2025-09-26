@@ -1,0 +1,54 @@
+name: Auto update uv.lock
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    # Weekly on Sunday
+    - cron: '0 3 * * 0'
+
+jobs:
+  update-lock:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.13'
+
+      - name: Install uv (curl installer)
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+
+      - name: Update uv.lock
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # Ensure project metadata is in place for uv to read
+          uv lock
+
+      - name: Create PR if uv.lock changed
+        uses: peter-evans/create-pull-request@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "chore: update uv.lock"
+          committer: "github-actions[bot] <github-actions[bot]@users.noreply.github.com>"
+          author: "github-actions[bot] <github-actions[bot]@users.noreply.github.com>"
+          title: "chore: update uv.lock"
+          body: |
+            This automated PR updates `uv.lock` by running `uv lock`.
+
+            Please review the lockfile changes before merging. Automated updates can be noisy; enable auto-merge only if you trust the maintainer policy.
+
+          base: main
+          branch: update/uv-lock-${{ github.run_id }}
+          draft: true
+          labels: |
+            dependencies
+            automated
+            needs-review

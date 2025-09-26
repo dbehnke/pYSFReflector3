@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches:
+      - main
+      - dbehnke/custom
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        python-version: [3.13]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install uv (curl installer)
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+
+      - name: Sync project environment from uv.lock (or install from requirements)
+        run: |
+          # If uv.lock exists, use uv sync to reproduce exact environment
+          if [ -f uv.lock ]; then
+            # Ensure the committed lockfile is up-to-date with project metadata
+            uv lock --check
+            uv sync
+          elif [ -f requirements.txt ]; then
+            # Fallback: install from requirements.txt
+            uv install -r requirements.txt
+          else
+            uv install pytest
+          fi
+
+      - name: Run tests via uv
+        run: |
+          uv run pytest -q

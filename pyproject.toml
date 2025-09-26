@@ -1,0 +1,10 @@
+[project]
+name = "pYSFReflector3"
+version = "0.0.1"
+description = "YSF Reflector (pYSFReflector3) - repeater/reflection server for YSF protocol"
+readme = "README.md"
+dependencies = []
+
+[tool.uv]
+# Let uv manage the project environment by default
+managed = true

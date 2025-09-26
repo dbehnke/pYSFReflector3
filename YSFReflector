@@ -29,7 +29,7 @@ import time
 import re
 import configparser
 import signal
-import datetime
+from datetime import datetime, UTC
 import bisect 
 import struct
 import ysffich
@@ -37,8 +37,19 @@ import ysfpayload
 import ysfutils
 import gps
 import ysfaprs
+from ysfaprs import APRS_LH
 import json
 from tinydb import TinyDB, Query
+import functools
+import gc
+from collections import defaultdict
+
+# Optional memory monitoring with psutil
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
 
 
 def ip2long(ip):
@@ -84,9 +95,34 @@ def stampa_lista(lista):
 #################################
 
 def inlist(a, x):
+    """Legacy function for sorted list membership - use fast_lookup for performance critical paths"""
     i = bisect.bisect_left(a, x)
     if i != len(a) and a[i] == x:
         return True
+    else:
+        return False
+
+# Performance optimized membership tests using sets
+def fast_inlist(lookup_manager, list_type, item):
+    """Fast O(1) membership test using sets instead of O(log n) binary search"""
+    if list_type == 'BLACK_LIST':
+        return lookup_manager.is_in_black_list(item)
+    elif list_type == 'WHITE_LIST':
+        return lookup_manager.is_in_white_list(item)
+    elif list_type == 'GW_BL':
+        return lookup_manager.is_in_gw_bl(item)
+    elif list_type == 'IP_BL':
+        return lookup_manager.is_in_ip_bl(item)
+    elif list_type == 'GW_LK':
+        return lookup_manager.is_in_gw_lk(item)
+    elif list_type == 'IP_LK':
+        return lookup_manager.is_in_ip_lk(item)
+    elif list_type == 'SUF_BL':
+        return lookup_manager.is_in_suf_bl(item)
+    elif list_type == 'SN_BL':
+        return lookup_manager.is_in_sn_bl(item)
+    elif list_type == 'BLK_TMP':
+        return lookup_manager.is_in_blk_tmp(item)
     else:
         return False        
 
@@ -101,12 +137,24 @@ def check_string(l):
 
 
 def RecvData(sock,recvPackets):
-    while True:
+    global shutdown_requested
+    global last_recv_by_fd
+    while not shutdown_requested:
         try:
-          data,addr = sock[0].recvfrom(2048)    # block if I don't receive anything 
+          data,addr = safe_recvfrom(sock[0], 2048)    # block if I don't receive anything 
+          # Record last remote address seen on this socket fileno so timeout logs can be enriched
+          try:
+            fd = sock[0].fileno()
+            last_recv_by_fd[fd] = addr
+          except Exception:
+            pass
           recvPackets.put((data,addr,sock))
-        except:
-          printlog(1, 'Error in RecvData') 
+        except OSError as e:
+          printlog(1, f'Socket error in RecvData: {e}')
+          if e.errno in [9, 104]:  # Bad file descriptor or Connection reset
+            break
+        except Exception as e:
+          printlog(1, f'Unexpected error in RecvData: {type(e).__name__}: {e}') 
         
 
 def CalcID(ref):
@@ -128,7 +176,8 @@ def CalcID(ref):
         
 def ElencoNodi(cl,qjs):
   global SCHED
-  while True:
+  global shutdown_requested
+  while not shutdown_requested:
     time.sleep(120)
     n_r = 0
     cl_lo = []
@@ -139,8 +188,8 @@ def ElencoNodi(cl,qjs):
       printlog(1, 'Currently linked repeaters/gateways:')
       for c in cl:
         n_r += 1
-        printlog(1, '     ' + c[2].ljust(10) + ': ' + str(c[0]).rjust(16) + ':' + str(c[1]).ljust(5) + ' ' + str(c[3]).rjust(2) + '/60 : ' + datetime.utcfromtimestamp(c[6]).strftime("%Y-%m-%d %H:%M:%S") + ' ' + str(c[8]).rjust(2) + ' ' + str(c[9]).rjust(2) + ' ' + str(c[12]).rjust(2) + ' ' + str(c[13]).rjust(6) + ' ' + str(c[14]).rjust(6))
-        sjson = '{"linked": "' + str(n_r) + '", "call": "' + c[2] + '", "IP": "' + str(c[0]) + '", "port": "' + str(c[1]) +'", "TC": "' + str(c[3]) + '", "CF": "' + datetime.datetime.utcfromtimestamp(c[6]).strftime("%Y-%m-%d %H:%M:%S") + '", "LO": "' + str(c[5]) + '", "LK": "' + str(c[7]) + '", "DGID": "' + str(c[8]).zfill(2) + '", "T_HOLD": "' + str(c[9])  + '", "BTH_DGID": "' + str(c[12]) + '", "BTH_TOUT": "' + str(c[13]) + '", "BTH_TCORR": "' + str(c[14]) + '"}'
+        printlog(1, '     ' + c[2].ljust(10) + ': ' + str(c[0]).rjust(16) + ':' + str(c[1]).ljust(5) + ' ' + str(c[3]).rjust(2) + '/60 : ' + datetime.fromtimestamp(c[6], tz=UTC).strftime("%Y-%m-%d %H:%M:%S") + ' ' + str(c[8]).rjust(2) + ' ' + str(c[9]).rjust(2) + ' ' + str(c[12]).rjust(2) + ' ' + str(c[13]).rjust(6) + ' ' + str(c[14]).rjust(6))
+        sjson = '{"linked": "' + str(n_r) + '", "call": "' + c[2] + '", "IP": "' + str(c[0]) + '", "port": "' + str(c[1]) +'", "TC": "' + str(c[3]) + '", "CF": "' + datetime.fromtimestamp(c[6], tz=UTC).strftime("%Y-%m-%d %H:%M:%S") + '", "LO": "' + str(c[5]) + '", "LK": "' + str(c[7]) + '", "DGID": "' + str(c[8]).zfill(2) + '", "T_HOLD": "' + str(c[9])  + '", "BTH_DGID": "' + str(c[12]) + '", "BTH_TOUT": "' + str(c[13]) + '", "BTH_TCORR": "' + str(c[14]) + '"}'
         qjs.put(sjson)
         if (c[5] == 1):
           cl_lo.append(c)
@@ -157,7 +206,7 @@ def ElencoNodi(cl,qjs):
     n_r = 0
     for c in SCHED:
       n_r += 1
-      sjson = '{"blk_time": "' + str(n_r) + '", "call": "' + c[0] + '", "BR": "' + c[1] + '", "TR": "' + datetime.datetime.utcfromtimestamp(c[2]).strftime("%Y-%m-%d %H:%M:%S") + '"}'  
+      sjson = '{"blk_time": "' + str(n_r) + '", "call": "' + c[0] + '", "BR": "' + c[1] + '", "TR": "' + datetime.fromtimestamp(c[2], tz=UTC).strftime("%Y-%m-%d %H:%M:%S") + '"}' 
       qjs.put(sjson)
     sjson = '{"total_blk_time": "' + str(n_r) + '"}'
     qjs.put(sjson)
@@ -165,7 +214,8 @@ def ElencoNodi(cl,qjs):
 
 def TimeoutNodi(cl):
   global lock_nodi
-  while True:
+  global shutdown_requested
+  while not shutdown_requested:
     time.sleep(1)
     for c in cl:
       bth = False
@@ -224,16 +274,22 @@ def TimeoutTX(stream, t_lock, r_lock, t_out, t_react, jsmess):
         type_ch = 'TD'
       else:
         type_ch = 'WD'
-      jsmess.put('{"stream_end": "' + str(t[5]).zfill(7) + '", "type": "' + type_ch + '", "time": "' +  str(datetime.datetime.now(datetime.UTC).strftime('%Y-%m-%d %H:%M:%S.%f'))[:-3] + '"}')
+      jsmess.put('{"stream_end": "' + str(t[5]).zfill(7) + '", "type": "' + type_ch + '", "time": "' +  str(datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S.%f'))[:-3] + '"}')
          
     if (((time.time() - t[6]) > t_out) and (t[0] != 0)):       # Tx timeout
       if (not inlist(BLK_TMP, t[3])):
         bisect.insort(BLK_TMP,t[3])  
         printlog(1, 'Timeout ' + t[3])
         t_sched =  time.time() + t_react
+        
+        # Enforce scheduler limit to prevent memory exhaustion
+        if len(SCHED) >= MAX_SCHEDULED_TASKS:
+          printlog(1, f'Maximum scheduled tasks ({MAX_SCHEDULED_TASKS}) reached, removing oldest task')
+          SCHED.pop(0)  # Remove oldest task
+        
         SCHED.append([t[3], 'RCT', t_sched])       # append scheduled remove from blocked list
         printlog(1, 'Appended scheduled job: ' + t[3] + '/RC at time '  + time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(t_sched))) 
-        jsmess.put('{"stream_timeout": "' +  str(t[5]).zfill(7) + '", "CS": "' + t[3] + '", "time": "' +  str(datetime.datetime.now(datetime.UTC).strftime('%Y-%m-%d %H:%M:%S.%f'))[:-3] + '"}')
+        jsmess.put('{"stream_timeout": "' +  str(t[5]).zfill(7) + '", "CS": "' + t[3] + '", "time": "' +  str(datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S.%f'))[:-3] + '"}')
         stream.remove(t)
            
    pop_list = []  
@@ -245,16 +301,26 @@ def TimeoutTX(stream, t_lock, r_lock, t_out, t_react, jsmess):
          r_lock.remove(d)
         
    for x in pop_list:
-     t_lock.pop(x)   
-     printlog(1, 'Removed from blockeds queue ' + str(x))
+     t_lock.pop(x)
+     try:
+       ts = str(datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S.%f'))[:-3]
+     except Exception:
+       ts = str(time.time())
+     printlog(1, f'Removed from blockeds queue {x} at {ts}')
    time.sleep(0.1)  
 
 def scheduler():
   global BLK_TMP
   global SCHED
-  while True:
+  global shutdown_requested
+  while not shutdown_requested:
     time.sleep(1)
     t = time.time()
+    
+    # Periodic memory monitoring (every 60 seconds)
+    if int(t) % 60 == 0:
+      memory_monitor()
+    
     try:
       for sc in SCHED:
         if (t > sc[2]):
@@ -271,6 +337,12 @@ def ckeck_wild_ptt(cs, tw, cnt, trea, jsmess):
   global BLK_TMP
   n = 0
   tc = time.time()
+  
+  # Enforce size limit on W_PTT to prevent memory leak
+  if len(W_PTT) >= MAX_W_PTT_ENTRIES:
+    W_PTT = W_PTT[-MAX_W_PTT_ENTRIES//2:]  # Keep only recent half
+    printlog(1, f'W_PTT list trimmed to {len(W_PTT)} entries')
+  
   W_PTT.append([cs, tc])
   for r in W_PTT:
     if (r[1] < (tc - tw)):
@@ -293,22 +365,36 @@ def canTrasmit(cs, re_en):
   global BLK_TMP
   global SUF_BL
 
-  call_sp = re.split(r'[-/\' \']', cs)
+  call_sp = re.split(r"[-/\' ]", cs)
   call = call_sp[0]
+  # Detailed debug: show normalized call and split parts when debug enabled
+  try:
+    if debug == 1:
+      printlog("d", f'canTrasmit: raw_cs="{cs}" call="{call}" call_sp={call_sp} re_en={re_en}')
+  except Exception:
+    pass
   
 ## always block a stream from repeater/node/gateway ###
   if (len(call_sp) > 1):
     if inlist(SUF_BL, call_sp[1]):
+      if debug == 1:
+        printlog("d", f'canTrasmit: blocked by SUF_BL suffix {call_sp[1]} for call {call}')
       return False      
   
   if inlist(BLK_TMP, call):
+    if debug == 1:
+      printlog("d", f'canTrasmit: blocked by BLK_TMP for call {call}')
     return False
       
 ## case CheckRE == 1 ###
   if (re_en == 1):  
     if inlist(WHITE_LIST, call):
+      if debug == 1:
+        printlog("d", f'canTrasmit: allowed by WHITE_LIST for call {call}')
       return True
     if inlist(BLACK_LIST, call):
+      if debug == 1:
+        printlog("d", f'canTrasmit: blocked by BLACK_LIST for call {call}')
       return False
     if (re.match(r'^\d?[A-Z]{1,2}\d{1,4}[A-Z]{1,3}$',call,re.IGNORECASE) and (len(call) <= 8)):
       return True
@@ -318,24 +404,40 @@ def canTrasmit(cs, re_en):
 ## case CheckRE == 0 ###
   if (re_en == 0):  
     if inlist(WHITE_LIST, call):
+      if debug == 1:
+        printlog("d", f'canTrasmit: allowed by WHITE_LIST for call {call} (CheckRE=0)')
       return True
     if inlist(BLACK_LIST, call):
+      if debug == 1:
+        printlog("d", f'canTrasmit: blocked by BLACK_LIST for call {call} (CheckRE=0)')
       return False
     return True
 
 ## case CheckRE == -1 ###
   if (re_en == -1):  
     if inlist(BLACK_LIST, call):
+      if debug == 1:
+        printlog("d", f'canTrasmit: blocked by BLACK_LIST for call {call} (CheckRE=-1)')
       return False
     if inlist(WHITE_LIST, call):
+      if debug == 1:
+        printlog("d", f'canTrasmit: allowed by WHITE_LIST for call {call} (CheckRE=-1)')
       return True
+    # Treat -1 as permissive for valid-looking calls (fall back to regex check)
+    if (re.match(r'^\d?[A-Z]{1,2}\d{1,4}[A-Z]{1,3}$',call,re.IGNORECASE) and (len(call) <= 8)):
+      if debug == 1:
+        printlog("d", f'canTrasmit: allowed by regex fallback for call {call} (CheckRE=-1)')
+      return True
+    if debug == 1:
+      printlog("d", f'canTrasmit: denied (no rule matched) for call {call} (CheckRE=-1)')
     return False
+    
     
     
 def lista_gw(cl):
   info = ''
   for c in cl:
-    info += c[2] + ':' + c[0] + ':' + str(c[1]) + ':' + datetime.datetime.utcfromtimestamp(c[6]).strftime("%d-%m-%Y %H-%M-%S") + ';'  
+    info += c[2] + ':' + c[0] + ':' + str(c[1]) + ':' + datetime.fromtimestamp(c[6], tz=UTC).strftime("%d-%m-%Y %H-%M-%S") + ';'  
   return info
 
 
@@ -368,8 +470,9 @@ def homedb(f_home, t_reload, cli, dgid_list):
   f_time_old = 0
   try:
     f_time = os.stat(f_home).st_mtime
-  except:
-    pass
+  except (OSError, IOError) as e:
+    printlog(1, f'Failed to get file stats for {f_home}: {e}')
+    f_time = 0
   
   while True:
     f_time = os.stat(f_home).st_mtime
@@ -387,7 +490,8 @@ def homedb(f_home, t_reload, cli, dgid_list):
               try:
                 dgid_int = int(c_split[1])
                 dgid_time = int(c_split[2])
-              except:
+              except (ValueError, IndexError) as e:
+                printlog(1, f'Invalid home database format in line: {content} - {e}')
                 dgid_int = 0
               # valid record  
               if (dgid_time == 0):
@@ -435,6 +539,7 @@ def homedb(f_home, t_reload, cli, dgid_list):
 
 
 def blacklist(f_bl, t_reload, cli):
+  global fast_lookup  # Add access to global fast lookup manager
   global BLACK_LIST
   global WHITE_LIST
   global GW_BL
@@ -454,81 +559,82 @@ def blacklist(f_bl, t_reload, cli):
     f_time = os.stat(f_bl).st_mtime
     if (f_time != f_time_old):
       try:
-        file = open(f_bl)
-        BL_TMP = []
-        GW_TMP = []
-        IP_TMP = []
-        WL_TMP = []
-        GW_LK_TMP = []
-        IP_LK_TMP = []
-        SUF_BL_TMP = []
-        SN_BL_TMP = []
-        printlog(1, 'Reload the Blacklist from File')
-        for row in file:
-          content = row.strip()
-          
-          # valid line (not a comment)
-          if ((len(content) > 3) and (content[0] != '#')):
-            c_split = content.split(':')
-            for i in range(len(c_split)):
-              c_split[i] = c_split[i].strip()
-              
+        with SafeFileHandler(f_bl, 'r') as file:
+          BL_TMP = []
+          GW_TMP = []
+          IP_TMP = []
+          WL_TMP = []
+          GW_LK_TMP = []
+          IP_LK_TMP = []
+          SUF_BL_TMP = []
+          SN_BL_TMP = []
+          printlog(1, 'Reload the Blacklist from File')
+          for row in file:
+            content = row.strip()
+
+            # Skip short lines and comments early
+            if not content or len(content) <= 3 or content[0] == '#':
+              continue
+
+            # Split and strip parts for processing
+            c_split = [part.strip() for part in content.split(':')]
+
             # CALL
             if (len(c_split) == 1 or c_split[0] == 'CS'):
               if (len(c_split) == 1):
                 cont = content
               if (c_split[0] == 'CS'):
-                cont = c_split[1] 
+                cont = c_split[1]
               if ((len(cont) <= 8) and (len(cont) >= 3)):
                 if (not inlist(BL_TMP, cont)):
-                  bisect.insort(BL_TMP,cont)
-            
-            # WL      
-            if (len(c_split) == 2 and c_split[0] == 'AL'):      
+                  bisect.insort(BL_TMP, cont)
+
+            # WL
+            if (len(c_split) == 2 and c_split[0] == 'AL'):
               if (not inlist(WL_TMP, c_split[1])):
-                bisect.insort(WL_TMP,c_split[1])
-                  
-            # GW      
-            if (len(c_split) == 2 and c_split[0] == 'GW'):      
+                bisect.insort(WL_TMP, c_split[1])
+
+            # GW
+            if (len(c_split) == 2 and c_split[0] == 'GW'):
               if (not inlist(GW_TMP, c_split[1])):
-                bisect.insort(GW_TMP,c_split[1])
-                
-            # GWB      
-            if (len(c_split) == 2 and c_split[0] == 'GWB'):      
+                bisect.insort(GW_TMP, c_split[1])
+
+            # GWB
+            if (len(c_split) == 2 and c_split[0] == 'GWB'):
               if (not inlist(GW_LK_TMP, c_split[1])):
-                bisect.insort(GW_LK_TMP,c_split[1])              
-           
-           # SUF      
-            if (len(c_split) == 2 and c_split[0] == 'SB'):      
+                bisect.insort(GW_LK_TMP, c_split[1])
+
+            # SUF
+            if (len(c_split) == 2 and c_split[0] == 'SB'):
               if (not inlist(SUF_BL_TMP, c_split[1])):
-                bisect.insort(SUF_BL_TMP,c_split[1])       
-           
-           # SN      
-            if (len(c_split) == 2 and c_split[0] == 'SN' and len(c_split[1]) == 5):      
+                bisect.insort(SUF_BL_TMP, c_split[1])
+
+            # SN
+            if (len(c_split) == 2 and c_split[0] == 'SN' and len(c_split[1]) == 5):
               if (not inlist(SN_BL_TMP, c_split[1])):
-                bisect.insort(SN_BL_TMP,c_split[1])       
-                
-            # IP      
-            if (len(c_split) == 2 and c_split[0] == 'IP'):      
+                bisect.insort(SN_BL_TMP, c_split[1])
+
+            # IP
+            if (len(c_split) == 2 and c_split[0] == 'IP'):
               try:
                 ipa = socket.gethostbyname(c_split[1])
                 ipl = ip2long(ipa)
-              except:
+              except Exception:
                 ipl = 0
                 printlog(2, 'Invalid hostname ' + c_split[1])
-              if (ipl > 0):  
+              if (ipl > 0):
                 if (not inlist(IP_TMP, ipl)):
                   bisect.insort(IP_TMP, ipl)
-            
-             # IPB      
-            if (len(c_split) == 2 and c_split[0] == 'IPB'):      
+
+            # IPB
+            if (len(c_split) == 2 and c_split[0] == 'IPB'):
               try:
                 ipa = socket.gethostbyname(c_split[1])
                 ipl = ip2long(ipa)
-              except:
+              except Exception:
                 ipl = 0
                 printlog(2, 'Invalid hostname ' + c_split[1])
-              if (ipl > 0):  
+              if (ipl > 0):
                 if (not inlist(IP_LK_TMP, ipl)):
                   bisect.insort(IP_LK_TMP, ipl)
                           
@@ -543,6 +649,16 @@ def blacklist(f_bl, t_reload, cli):
       IP_LK = IP_LK_TMP.copy()
       SUF_BL = SUF_BL_TMP.copy()
       SN_BL = SN_BL_TMP.copy()
+      # Sync fast lookup sets with updated lists for O(1) performance (only if initialized)
+      try:
+        fl = globals().get('fast_lookup')
+        if fl is not None and hasattr(fl, 'sync_from_lists'):
+          fl.sync_from_lists(BLACK_LIST, WHITE_LIST, GW_BL, IP_BL, GW_LK, IP_LK, SUF_BL, SN_BL, BLK_TMP)
+        else:
+          printlog(2, 'fast_lookup not initialized; skipping sync')
+      except Exception as e:
+        # If sync fails at runtime, log the error but do not let the blacklist thread crash
+        printlog(1, f'Error syncing fast_lookup: {e}')
       printlog(1, 'Loaded ' + str(len(BLACK_LIST)) + '/CS ' + str(len(WHITE_LIST)) + '/AL ' + str(len(GW_BL)) + '/GW ' + str(len(IP_BL)) + '/IP ' + str(len(GW_LK)) + '/GWB ' + str(len(IP_LK)) + '/IPB ' + str(len(SUF_BL)) + '/SB ' + str(len(SN_BL)) + '/SN')
       f_time_old = f_time
       update_clients(cli)
@@ -838,9 +954,11 @@ def json_send(q,s,cl): #queue, socket, clients
       mess = q.get()
       for c in cl:
         # printlog(1, 'send ' + mess + ' at ' + str(c[0]) + ':' + str(c[1])) 
-        s.sendto(str.encode(mess), (c[0], c[1])) 
+        safe_sendto(s, str.encode(mess), (c[0], c[1])) 
+    except (OSError, socket.error) as e:
+      printlog(1, f'Network error in json_send: {e}')
     except Exception as e:
-      printlog(1, 'Error in json_send ' + str(e))        
+      printlog(1, f'Unexpected error in json_send: {e}')        
             
 def json_recv(q,s,cl):
   global version
@@ -857,7 +975,7 @@ def json_recv(q,s,cl):
     
   while True:
     try:
-      data,addr = s.recvfrom(1024)    
+      data,addr = safe_recvfrom(s, 1024)    
       if (data == b'CONNREQ'):
         pres = False
         for c in cl:
@@ -868,12 +986,12 @@ def json_recv(q,s,cl):
           cl.append([addr[0], addr[1], 0])
           printlog(1, 'added json client: ' + str(addr)) 
           connstr = 'CONNOK:' + str(addr[0]) + ':' + str(addr[1]) 
-          s.sendto(str.encode(connstr), addr)
+          safe_sendto(s, str.encode(connstr), addr)
           q.put('{"system": "pYSFReflector3", "ver": "' + version + '", "REF_ID": "' + str(refl_id).zfill(5) + '", "REF_NAME": "' + refl_name + '", "REF_DESC": "' + refl_desc + '", "APRS_EN": "' + str(aprs_en) + '", "APRS_SSID": "' + aprs_ssid + '", "contact": "' + refl_contact + '", "web": "' + refl_web + '", "dgid_loc": "' + str(dgid_local) + '", "dgid_def": "' + str(dgid_default) + '", "dgid_list": "' + str(dgid_list) + '"}')
       if (data == b'PING'):  
         for c in cl:
           if ((c[0] == addr[0]) and (c[1] == addr[1])):
-            s.sendto(b'PONG', addr)
+            safe_sendto(s, b'PONG', addr)
             # printlog(1, 'PING from: ' + str(addr)) 
             c[2] = 0
             break
@@ -882,13 +1000,15 @@ def json_recv(q,s,cl):
           if ((c[0] == addr[0]) and (c[1] == addr[1])):
             printlog(1, 'Removing json client ' + c[0] + ':' + str(c[1]) + ' unlinked')
             connstr = 'BYE:' + str(addr[0]) + ':' + str(addr[1]) 
-            s.sendto(str.encode(connstr), addr)
+            safe_sendto(s, str.encode(connstr), addr)
             cl.remove(c)
             break
             
               
+    except (OSError, socket.error) as e:
+      printlog(1, f'Network error in json_recv: {e}')
     except Exception as e:
-      printlog(1, 'Error in json_recv ' + str(e))             
+      printlog(1, f'Unexpected error in json_recv: {e}')             
 
 def dgid_static(gw):
   s = gw.split('-')
@@ -932,6 +1052,13 @@ def RunServer(config):
     print('Starting pYSFReflector-' + version)
     printlog(4, 'Starting pYSFReflector-' + version)
     
+    # Log initial memory usage if available
+    initial_memory = get_memory_usage()
+    if initial_memory.get('available', False):
+        printlog(1, f'Initial memory usage: RSS={initial_memory["rss_mb"]:.1f}MB, Percent={initial_memory["percent"]:.1f}%')
+    else:
+        printlog(1, 'Memory monitoring: psutil not available, using basic cleanup only')
+    
     host = config[22]   
     port = config[5]
       
@@ -943,6 +1070,8 @@ def RunServer(config):
     for s_i in sock_port:
       s = socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
       s.setblocking(1)
+      s.settimeout(5.0)  # 5 second timeout for network operations
+      s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # Allow address reuse
       s.bind((host,s_i[1]))
       sock_list.append([s, s_i[0]])
       printlog(1,'Add port ' + str(s_i[1]) + ' linked to DG-ID ' + str(s_i[0]))
@@ -955,11 +1084,15 @@ def RunServer(config):
       
     sjson = socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
     sjson.setblocking(1)
+    sjson.settimeout(5.0)  # 5 second timeout for JSON socket
+    sjson.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # Allow address reuse
     sjson.bind((json_host,json_port))
     
     
     clients_json = []
-    clients = []   # addr, port, gw, t_corr, ID, lonly, t_conn, locked, DG-ID, T_hold, busy, socket, dg-id_home, time_home, time_home_act
+    # Initialize optimized data structures
+    client_manager = ClientLookup()
+    clients = client_manager.get_all_clients()  # For backward compatibility
     c = []
     rx_lock = []
     rx_lock_tout = {}
@@ -968,8 +1101,28 @@ def RunServer(config):
     # stream
     tx = [0, 0, '', '', '', 0, 0, 0.0, 0.0, 0, 0, '', '', 0, False,'',0]  # id_gw, tout, gateway, src, dest, id_stream, start_time, lat, long, DG-ID, local, rem12, rem34, radio_code, coord_send, src_clean, stream type
     
-    # list of stream
-    STR = []
+    # Initialize optimized stream management
+    stream_manager = StreamManager()
+    STR = stream_manager.get_all_streams()  # For backward compatibility
+    
+    # Initialize fast lookup manager for blacklists/whitelists
+    try:
+      fast_lookup = FastLookupManager()
+    except Exception as e:
+      # Fatal startup failure: log to stdout and to file if available, then exit
+      fatal_msg = f'FATAL: Failed to initialize FastLookupManager: {e}'
+      try:
+        printlog(1, fatal_msg)
+      except Exception:
+        # If printlog is not usable for some reason, fall back to stdout
+        print(fatal_msg)
+      try:
+        # Also attempt to write to the rotated log file if printlog_orig and file logging are configured
+        printlog_orig(1, fatal_msg)
+      except Exception:
+        pass
+      # Exit so orchestrators can handle restart/alerting
+      sys.exit(1)
     
     refl_name = config[1][:16]
     refl_desc = config[2][:14]
@@ -1022,56 +1175,94 @@ def RunServer(config):
     gps_data = []
         
     for s in sock_list:
-      threading.Thread(target=RecvData,args=(s,recvPackets)).start()
+      thread = threading.Thread(target=RecvData,args=(s,recvPackets))
+      thread.daemon = True
+      thread.start()
     
-    threading.Thread(target=ElencoNodi,args=(clients,json_mess)).start()
-    threading.Thread(target=TimeoutNodi,args=(clients,)).start()
-    threading.Thread(target=json_recv,args=(json_mess,sjson,clients_json)).start()
-    threading.Thread(target=json_send,args=(json_mess,sjson,clients_json)).start()
-    threading.Thread(target=TimeoutNodiJS,args=(clients_json,)).start()
-    threading.Thread(target=TimeoutTX,args=(STR, rx_lock_tout, rx_lock, timeout, treactivate, json_mess)).start()
-    threading.Thread(target=scheduler,args=[]).start()
+    thread = threading.Thread(target=ElencoNodi,args=(clients,json_mess))
+    thread.daemon = True
+    thread.start()
+    thread = threading.Thread(target=TimeoutNodi,args=(clients,))
+    thread.daemon = True
+    thread.start()
+    thread = threading.Thread(target=json_recv,args=(json_mess,sjson,clients_json))
+    thread.daemon = True
+    thread.start()
+    thread = threading.Thread(target=json_send,args=(json_mess,sjson,clients_json))
+    thread.daemon = True
+    thread.start()
+    thread = threading.Thread(target=TimeoutNodiJS,args=(clients_json,))
+    thread.daemon = True
+    thread.start()
+    thread = threading.Thread(target=TimeoutTX,args=(STR, rx_lock_tout, rx_lock, timeout, treactivate, json_mess))
+    thread.daemon = True
+    thread.start()
+    thread = threading.Thread(target=scheduler,args=[])
+    thread.daemon = True
+    thread.start()
     if (len(f_blacklist) > 0):
-      threading.Thread(target=blacklist,args=(f_blacklist,tr_blacklist,clients)).start()
+      thread = threading.Thread(target=blacklist,args=(f_blacklist,tr_blacklist,clients))
+      thread.daemon = True
+      thread.start()
     if aprs_en:
-      threading.Thread(target=aprs_send_data,args=(aprs_server, 'YSF' + str(refl_id).zfill(5), aprs_port)).start()
+      thread = threading.Thread(target=aprs_send_data,args=(aprs_server, 'YSF' + str(refl_id).zfill(5), aprs_port))
+      thread.daemon = True
+      thread.start()
     if (len(f_homedb) > 0):
-      threading.Thread(target=homedb,args=(f_homedb,tr_blacklist,clients,dgid_list)).start()
+      thread = threading.Thread(target=homedb,args=(f_homedb,tr_blacklist,clients,dgid_list))
+      thread.daemon = True
+      thread.start()
     
     time_start = time.time()
     
     
-    while True:
+    while not shutdown_requested:
       try:                                       # protection from errors in infinite loop
-            data_ns, addr, sock = recvPackets.get()    # blocked if queue is empty
+            data_ns, addr, sock = recvPackets.get(timeout=1)    # blocked if queue is empty, timeout for shutdown check
             s = sock[0]
             # printlog(1,'Socket ID: ' + str(sock[1]))
             data = sanitize_msg(data_ns)
+            # Debug: log packet receipt with cmd, addr and socket DG-ID when debug enabled
+            if debug == 1:
+              try:
+                sock_dgid = sock[1] if isinstance(sock, (list, tuple)) and len(sock) > 1 else '?'
+                printlog("d", f'Received packet cmd={data[0:4]} from {addr[0]}:{addr[1]} len={len(data_ns)} socket_dgid={sock_dgid}')
+              except Exception:
+                pass
+            
+            # Monitor memory usage periodically
+            memory_monitor()
             cmd = data[0:4]
             
             if debug == 1:
               hex_dump(data)
 
             if (cmd == b'YSFP'):
-              pres = False
-              for c in clients:
-                if ((c[0] == addr[0]) and (c[1] == addr[1]) and (c[11].getsockname()[0] == s.getsockname()[0]) and (c[11].getsockname()[1] == s.getsockname()[1])):
-                  pres = True
+              # Use optimized client lookup instead of linear search
+              c = client_manager.find_client(addr[0], addr[1], s)
+              pres = c is not None
+              if pres:
+                  # Debug: log that an existing client record was found and its DG-ID
+                  if debug == 1:
+                    try:
+                      client_dgid = c[8] if len(c) > 8 else '?'
+                      printlog("d", f'Existing client seen: {c[2] if len(c)>2 else "<no-call>"} {addr[0]}:{addr[1]} dgid={client_dgid}')
+                    except Exception:
+                      pass
                   lock_nodi.acquire()
                   c[3] = 0
                   lock_nodi.release()
-                  break
               if not pres:  
                 lonly = 0
                 locked = 0
-                if inlist(GW_BL, (data[4:14]).decode().strip()):
+                if fast_inlist(fast_lookup, 'GW_BL', (data[4:14]).decode().strip()):
                   lonly = 1
-                if inlist(IP_BL, ip2long(addr[0])):
+                if fast_inlist(fast_lookup, 'IP_BL', ip2long(addr[0])):
                   lonly = 1 
-                if inlist(GW_LK, (data[4:14]).decode().strip()):
+                if fast_inlist(fast_lookup, 'GW_LK', (data[4:14]).decode().strip()):
                   locked = 1
                   lonly = 1
-                if inlist(IP_LK, ip2long(addr[0])):
+                if fast_inlist(fast_lookup, 'IP_LK', ip2long(addr[0])):
                   locked = 1 
                   lonly = 1
                 # new gateway 
@@ -1110,31 +1301,74 @@ def RunServer(config):
                   dgid = dgid_default
                   t_hold = 0
                   
-                c=[addr[0], addr[1], (data[4:14]).decode().strip(), 0, id, lonly, time.time(), locked, dgid, t_hold, 0, sock[0], dgid_home, dgid_time, 0]
-                id += 1
-                clients.append(c)
-                printlog(1, 'Adding ' + c[2].ljust(10) + ' (' + c[0] + ':' + str(c[1]) + ') DG-ID ' + str(dgid))
-              s.sendto(b'YSFPREFLECTOR ',addr)
+                # Enforce client limit to prevent memory exhaustion
+                if len(client_manager) >= MAX_CLIENTS:
+                  printlog(1, f'Maximum clients ({MAX_CLIENTS}) reached, rejecting new connection from {addr[0]}:{addr[1]}')
+                else:
+                  c=[addr[0], addr[1], (data[4:14]).decode().strip(), 0, id, lonly, time.time(), locked, dgid, t_hold, 0, sock[0], dgid_home, dgid_time, 0]
+                  id += 1
+                  client_manager.add_client(c)
+                  printlog(1, 'Adding ' + c[2].ljust(10) + ' (' + c[0] + ':' + str(c[1]) + ') DG-ID ' + str(dgid))
+              safe_sendto(s, b'YSFPREFLECTOR ', addr)
            
             if (cmd == b'YSFU'):
-              for c in clients:
-                if ((c[0] == addr[0]) and (c[1] == addr[1]) and (c[11].getsockname()[0] == s.getsockname()[0]) and (c[11].getsockname()[1] == s.getsockname()[1])):
+              # Use optimized client lookup for removal
+              c = client_manager.find_client(addr[0], addr[1], s)
+              if c:
                   printlog(1, 'Removing ' + c[2].ljust(10) + ' (' + c[0] + ':' + str(c[1]) + ') unlinked')
-                  clients.remove(c)
-                  break
+                  client_manager.remove_client(c)
               
-            if ((cmd == b'YSFD') and (len(data) == 155)):
+            if (cmd == b'YSFD'):
+              # Diagnostic: log unexpected packet sizes for YSFD to aid debugging
+              if len(data) != 155:
+                printlog("d", f'YSFD packet received with unexpected length={len(data)} from {addr[0]}:{addr[1]} socket_dgid={sock[1]}')
+                # Skip processing packets that aren't the expected length
+                continue
               #print(data)                                     
               ba_data = bytearray(data)
               data_mod = bytearray(data) 
-              gw_tx = []
-              for c in clients:                                 
-                if ((c[0] == addr[0]) and (c[1] == addr[1]) and (c[11].getsockname()[0] == s.getsockname()[0]) and (c[11].getsockname()[1] == s.getsockname()[1])):
-                  gw_tx = c
+              # Use optimized client lookup
+              gw_tx = client_manager.find_client(addr[0], addr[1], s)
+              # Fallback: if no exact match (different source port), try match by gateway name
+              # This is safer than matching by IP only when multiple clients use the same IP.
+              if (not gw_tx):
+                try:
+                  gw_name = data[4:14].decode().strip()
+                except Exception:
+                  gw_name = ''
+                if gw_name:
+                  candidates = []
+                  try:
+                    # Prefer direct access to client list if available
+                    if hasattr(client_manager, 'clients'):
+                      for cc in getattr(client_manager, 'clients'):
+                        if (len(cc) > 2) and (cc[2] == gw_name):
+                          candidates.append(cc)
+                    else:
+                      # Fallback to a potential getter if implemented
+                      if hasattr(client_manager, 'get_all_clients'):
+                        for cc in client_manager.get_all_clients():
+                          if (len(cc) > 2) and (cc[2] == gw_name):
+                            candidates.append(cc)
+                  except Exception:
+                    candidates = []
+
+                  if len(candidates) == 1:
+                    gw_tx = candidates[0]
+                    printlog(1, f'Fallback: matched gateway by name {gw_name} -> {gw_tx[0]}:{gw_tx[1]}')
+                  elif len(candidates) > 1:
+                    # Narrow candidates by IP if possible
+                    ip_match = [cc for cc in candidates if (len(cc) > 0 and cc[0] == addr[0])]
+                    if len(ip_match) == 1:
+                      gw_tx = ip_match[0]
+                      printlog(1, f'Fallback: matched gateway by name+IP {gw_name} -> {gw_tx[0]}:{gw_tx[1]}')
+                    else:
+                      if debug == 1:
+                        printlog("d", f'Fallback ambiguous for gateway name {gw_name}, candidates={len(candidates)}; skipping fallback')
+              if gw_tx:
                   lock_nodi.acquire()
                   gw_tx[14] = 0
                   lock_nodi.release()
-                  break
               
               
               if (gw_tx):
@@ -1143,16 +1377,24 @@ def RunServer(config):
                   tx[3] = data[14:24].decode().strip()
                   tx[15] = re.split(r'[-/]', tx[3].strip())[0]
                   dgid_busy = False
-                  for st in STR:
-                    if (st[9] == gw_tx[8]):
+                  # Use optimized stream lookup by DG-ID
+                  dgid_streams = stream_manager.find_streams_by_dgid(gw_tx[8])
+                  if dgid_streams:
                       dgid_busy = True
+                  
+                  # Find specific stream for this gateway
+                  tx_found = None
+                  for st in dgid_streams:
                     if (((st[9] == gw_tx[8]) and (st[0] == gw_tx[4])) or ((gw_tx[8] == dgid_local) and (st[9] == -gw_tx[4])) ):
-                      tx = st
+                      tx_found = st
+                      break
+                  
+                  if tx_found:
+                      tx = tx_found
                       rem12 = tx[11]
                       rem34 = tx[12]
                       radio_code = tx[13]
                       coord_send = tx[14]
-                      break
                       
                   if ysffich.decode(data[40:]): 
                     FI = ysffich.getFI()
@@ -1178,6 +1420,8 @@ def RunServer(config):
                           data_mod[:35] = ba_data[:35]
                           data_mod[35:] = data_p  
                     else:
+                      # If decode failed, log diagnostic info so we can understand why FICH wasn't parsed
+                      printlog("d", f'FICH decode returned False for packet from {addr[0]}:{addr[1]} gw={data[4:14].decode().strip()} src={data[14:24].decode().strip()} len={len(data)} FI={ysffich.getFI()} DT={ysffich.getDT()}')
                       if ((FN == 1) and (DT == 2) and (dgid_prefix > 0)):
                         data_p = ba_data[35:]
                         src = (str(gw_tx[8]) + '/' + tx[15].strip()).ljust(10).encode()
@@ -1240,15 +1484,15 @@ def RunServer(config):
                         tx_ok = False
                         block_r = 'DT'
                       else:
-                        if (inlist(GW_BL, gw_corr) or inlist(GW_LK, gw_corr)):
+                        if (fast_inlist(fast_lookup, 'GW_BL', gw_corr) or fast_inlist(fast_lookup, 'GW_LK', gw_corr)):
                           tx_ok = False
                           block_r = 'GW'
                         else:
-                          if (inlist(IP_BL, ip2long(addr[0])) or inlist(IP_LK, ip2long(addr[0]))):
+                          if (fast_inlist(fast_lookup, 'IP_BL', ip2long(addr[0])) or fast_inlist(fast_lookup, 'IP_LK', ip2long(addr[0]))):
                             tx_ok = False
                             block_r = 'IP'      
                           else:
-                            if ((ysffich.getCM() == 1) and (len(ysfpayload.m_dest) == 10) and (ysfpayload.m_dest != '**********') and (inlist(SN_BL, ysfpayload.m_dest[5:10]))):
+                            if ((ysffich.getCM() == 1) and (len(ysfpayload.m_dest) == 10) and (ysfpayload.m_dest != '**********') and (fast_inlist(fast_lookup, 'SN_BL', ysfpayload.m_dest[5:10]))):
                               tx_ok = False
                               block_r = 'SN'
                             else:
@@ -1295,7 +1539,15 @@ def RunServer(config):
                         else:  
                           tx[9] = gw_tx[8]
                         lock_tx.release() 
-                        STR.append(tx)
+                        
+                        # Enforce stream limit to prevent memory exhaustion
+                        if len(stream_manager) >= MAX_STREAM_COUNT:
+                          printlog(1, f'Maximum streams ({MAX_STREAM_COUNT}) reached, dropping oldest stream')
+                          if stream_manager.streams:  # Remove oldest stream
+                              oldest = stream_manager.streams[0]
+                              stream_manager.remove_stream(oldest)
+                        
+                        stream_manager.add_stream(tx)
                         if (not hc_ok):
                           printlog(1, '<' + str(tx[5]).zfill(7) + '> Stream opened with invalid HC')  
                         if ((len(ysfpayload.m_dest) == 0) or (ysfpayload.m_dest == '**********')):  
@@ -1305,15 +1557,26 @@ def RunServer(config):
                         fich_str = 'FICH-Data: CS:' + str(ysffich.getCS()) + ' | CM:' + str(ysffich.getCM()) + ' | FT:' + str(ysffich.getFT()) + ' | Dev:' + str(ysffich.getDev()) + ' | MR:' + str(ysffich.getMR()) + ' | VoIP:' + str(ysffich.getVoIP()) + ' | DT:' + str(ysffich.getDT()) + ' | SQL:' + str(ysffich.getSQL()) + ' | SQC:' + str(ysffich.getSQ()) 
                         fich_str_json = '"CS": "' + str(ysffich.getCS()) + '", "CM": "' + str(ysffich.getCM()) + '", "FT": "' + str(ysffich.getFT()) + '", "Dev": "' + str(ysffich.getDev()) + '", "MR": "' + str(ysffich.getMR()) + '", "VoIP": "' + str(ysffich.getVoIP()) + '", "DT": "' + str(ysffich.getDT()) + '", "SQL": "' + str(ysffich.getSQL()) + '", "SQC": "' + str(ysffich.getSQ()) + '"'
                         printlog(1, '<' + str(tx[5]).zfill(7) + '> Received data from ' + tx[3].ljust(10) +   ' to ' +  dst + ' at ' +  tx[2].ljust(10)+ ' ' + fich_str)
-                        json_mess.put('{"stream_start": "' + str(tx[5]).zfill(7) + '", "call": "' + tx[3] + '", "target": "' + dst + '", "gw": "' +  tx[2] + '",  "dgid": "' +  str(tx[9]).zfill(2) + '", "time": "' + str(datetime.now(datetime.UTC).strftime('%Y-%m-%d %H:%M:%S.%f'))[:-3] + '", ' + fich_str_json + '}')
+                        json_mess.put('{"stream_start": "' + str(tx[5]).zfill(7) + '", "call": "' + tx[3] + '", "target": "' + dst + '", "gw": "' +  tx[2] + '",  "dgid": "' +  str(tx[9]).zfill(2) + '", "time": "' + str(datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S.%f'))[:-3] + '", ' + fich_str_json + '}')
                         printlog(1, '<' + str(tx[5]).zfill(7) + '> Additional information dst:' +  ysfpayload.m_dest.ljust(10) + ' src:' +  ysfpayload.m_source.ljust(10) + ' uplink:' + ysfpayload.m_uplink.ljust(10) + ' downlink:' + ysfpayload.m_downlink.ljust(10))
                         json_mess.put('{"stream_id05": "' + str(tx[5]).zfill(7) + '", "dst": "' + ysfpayload.m_dest + '", "src": "' + ysfpayload.m_source + '", "uplink": "' +  ysfpayload.m_uplink + '", "downlink": "' + ysfpayload.m_downlink + '"}')
                         ckeck_wild_ptt(tx[3], wptttime, wpttcount, treactivate, json_mess)
                     else:
                       if (id_corr not in rx_lock):
                         rx_lock.append(id_corr)  
-                        printlog(1, 'Data from ' + data[14:24].decode().strip().ljust(10) + ' at ' + data[4:14].decode().strip().ljust(10) + ' blocked/' + block_r)
-                        json_mess.put('{"blocked": "-1", "CS": "' + data[14:24].decode().strip().ljust(10) + '", "GW": "' + data[4:14].decode().strip().ljust(10) + '", "BR": "' +  block_r +'", "time": "' + str(datetime.datetime.now(datetime.UTC).strftime('%Y-%m-%d %H:%M:%S.%f'))[:-3] + '"}')
+                        # Include stream id and DG-ID (if available) in logs to diagnose rx_lock reasons
+                        try:
+                          # Prefer an explicitly-set tx[9] (DG-ID); if it's default/zero, fall back to gw_tx[8]
+                          if ('tx' in locals() and isinstance(tx, (list, tuple)) and len(tx) > 9 and tx[9]):
+                            dgid_info = str(tx[9])
+                          elif ('gw_tx' in locals() and isinstance(gw_tx, (list, tuple)) and len(gw_tx) > 8):
+                            dgid_info = str(gw_tx[8])
+                          else:
+                            dgid_info = '?'
+                        except Exception:
+                          dgid_info = '?'
+                        printlog(1, 'Data from ' + data[14:24].decode().strip().ljust(10) + ' at ' + data[4:14].decode().strip().ljust(10) + ' blocked/' + block_r + ' stream_id=' + str(id_corr) + ' dgid=' + dgid_info)
+                        json_mess.put('{"blocked": "-1", "CS": "' + data[14:24].decode().strip().ljust(10) + '", "GW": "' + data[4:14].decode().strip().ljust(10) + '", "BR": "' +  block_r + '", "stream_id": "' + str(id_corr) + '", "dgid": "' + dgid_info + '", "time": "' + str(datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S.%f'))[:-3] + '"}')
                       rx_lock_tout[id_corr] = 0  
                     
                     if ((id_corr == tx[0]) and (id_corr != 0)):    
@@ -1322,28 +1585,134 @@ def RunServer(config):
                       lock_tx.release()
                    
                     if (tx[10] == 0):
-                      for c in clients:
-                        if (((c[0] != addr[0]) or (c[1] != addr[1]) or (c[11].getsockname()[0] != s.getsockname()[0]) or (c[11].getsockname()[1] != s.getsockname()[1])) and (id_corr == tx[0]) and (id_corr != 0) and (id_corr not in rx_lock) and (c[7] == 0) and (c[8] == gw_tx[8])):
+                      # Use optimized DG-ID lookup instead of scanning all clients
+                      dgid_clients = client_manager.get_clients_by_dgid(gw_tx[8])
+                      # Debug dump: show id_corr, active stream ids, and rx_lock snapshot to diagnose forwarding blocks
+                      if debug == 1:
+                        try:
+                          # id_corr may be local to outer scope; capture safely
+                          current_id_corr = id_corr if 'id_corr' in locals() else (tx[0] if isinstance(tx, (list, tuple)) and len(tx) > 0 else 0)
+                        except Exception:
+                          current_id_corr = '?'
+                        try:
+                          # Build a compact list of active stream ids from stream_manager
+                          active_streams = []
+                          # stream_manager may provide a public list or iterator; attempt common access patterns
+                          if hasattr(stream_manager, 'streams'):
+                            for srec in getattr(stream_manager, 'streams'):
+                              try:
+                                active_streams.append(srec[0])
+                              except Exception:
+                                pass
+                          elif hasattr(stream_manager, 'list'):
+                            for srec in getattr(stream_manager, 'list'):
+                              try:
+                                active_streams.append(srec[0])
+                              except Exception:
+                                pass
+                          else:
+                            # Fallback: try iterating if it's list-like
+                            try:
+                              for srec in stream_manager:
+                                try:
+                                  active_streams.append(srec[0])
+                                except Exception:
+                                  pass
+                            except Exception:
+                              active_streams = ['<unknown>']
+                        except Exception:
+                          active_streams = ['<err>']
+                        try:
+                          rx_lock_snapshot = list(rx_lock) if isinstance(rx_lock, (list, set, tuple)) else str(rx_lock)
+                        except Exception:
+                          rx_lock_snapshot = '<err>'
+                        try:
+                          blk_tmp_snapshot = list(BLK_TMP) if isinstance(BLK_TMP, (list, set, tuple)) else str(BLK_TMP)
+                        except Exception:
+                          blk_tmp_snapshot = '<err>'
+                        try:
+                          suf_bl_snapshot = list(SUF_BL) if isinstance(SUF_BL, (list, set, tuple)) else str(SUF_BL)
+                        except Exception:
+                          suf_bl_snapshot = '<err>'
+                        try:
+                          bl_count = len(BLACK_LIST) if isinstance(BLACK_LIST, (list, set, tuple)) else '?'
+                        except Exception:
+                          bl_count = '?'
+                        try:
+                          wl_count = len(WHITE_LIST) if isinstance(WHITE_LIST, (list, set, tuple)) else '?'
+                        except Exception:
+                          wl_count = '?'
+                        printlog("d", f'DEBUG DUMP BEFORE SEND: id_corr={current_id_corr} active_streams={active_streams} rx_lock={rx_lock_snapshot} dgid={gw_tx[8]} tx_stream={tx[0]} BLK_TMP={blk_tmp_snapshot} SUF_BL={suf_bl_snapshot} BL_count={bl_count} WL_count={wl_count}')
+
+                      for c in dgid_clients:
+                        # Debug info for why a client may be skipped or used
+                        try:
+                          candidate_ip = c[0]
+                          candidate_port = c[1]
+                          candidate_sock = c[11] if len(c) > 11 else None
+                          candidate_callsign = c[2] if len(c) > 2 else '<no-call>'
+                        except Exception:
+                          candidate_ip = '<err>'
+                          candidate_port = 0
+                          candidate_sock = None
+                          candidate_callsign = '<err>'
+
+                        skip_reasons = []
+                        # Evaluate skip conditions and record reasons
+                        if (candidate_ip == addr[0] and candidate_port == addr[1]):
+                          skip_reasons.append('same-src')
+                        if (candidate_sock is None or not hasattr(candidate_sock, 'getsockname')):
+                          skip_reasons.append('no-sock')
+                        else:
                           try:
-                           # lock_nodi.acquire()
-                           # c[14] = 0
-                           # lock_nodi.release()
+                            if (candidate_sock.getsockname()[0] != s.getsockname()[0] or candidate_sock.getsockname()[1] != s.getsockname()[1]):
+                              skip_reasons.append('different-socket')
+                          except Exception:
+                            skip_reasons.append('sock-getname-err')
+                        if (id_corr != tx[0] or id_corr == 0):
+                          skip_reasons.append('id-mismatch')
+                        if (id_corr in rx_lock):
+                          skip_reasons.append('rx-locked')
+                        if (c[7] != 0):
+                          skip_reasons.append('muted')
+
+                        if debug == 1:
+                          # Try to include stream id and dgid for better context
+                          try:
+                            cand_dgid = str(c[8]) if len(c) > 8 else '?'
+                          except Exception:
+                            cand_dgid = '?'
+                          try:
+                            stream_id = str(tx[0]) if 'tx' in locals() and isinstance(tx, (list, tuple)) else '?'
+                          except Exception:
+                            stream_id = '?'
+                          printlog("d", f'Candidate for send: {candidate_callsign} {candidate_ip}:{candidate_port} dgid={cand_dgid} stream_id={stream_id} checks skip_reasons={skip_reasons}')
+
+                        if (((candidate_ip != addr[0]) or (candidate_port != addr[1]) or (not skip_reasons)) and (id_corr == tx[0]) and (id_corr != 0) and (id_corr not in rx_lock) and (c[7] == 0)):
+                          try:
+                            # lock_nodi.acquire()
+                            # c[14] = 0
+                            # lock_nodi.release()
                             if (c[9] < 0):                        
-                              c[11].sendto(data,(c[0], c[1]))
+                              safe_sendto(c[11], data, (c[0], c[1]))
                             else:
                               #s.sendto(data,(c[0], c[1]))
-                              c[11].sendto((data_mod),(c[0], c[1]))  
-                          except:
-                            printlog(1, 'Error sending data')        
+                              safe_sendto(c[11], data_mod, (c[0], c[1]))  
+                            if debug == 1:
+                              printlog("d", f'Sent to {candidate_callsign} {candidate_ip}:{candidate_port}')
+                          except (OSError, socket.error) as e:
+                            printlog(1, f'Network error sending data to {c[0]}:{c[1]}: {e}')
+                          except Exception as e:
+                            printlog(1, f'Unexpected error sending data to {c[0]}:{c[1]}: {e}')        
                   
                     if ((FI == 2) and (tx[0] == id_corr) and (tx[0] !=0)):
                       printlog(1, '<' + str(tx[5]).zfill(7) + '> Received end of transmission coords: ' + "{:.6f}".format(tx[7]) + ', ' + "{:.6f}".format(tx[8]))
-                      STR.remove(tx)
+                      stream_manager.remove_stream(tx)
                       if (tx[16] == 1):
                         type_ch = 'TD'
                       else:
                         type_ch = 'TC'  
-                      json_mess.put('{"stream_end": "' + str(tx[5]).zfill(7) + '", "type": "' + type_ch + '", "time": "' +  str(datetime.datetime.now(datetime.UTC).strftime('%Y-%m-%d %H:%M:%S.%f'))[:-3] + '"}')
+                      json_mess.put('{"stream_end": "' + str(tx[5]).zfill(7) + '", "type": "' + type_ch + '", "time": "' +  str(datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S.%f'))[:-3] + '"}')
                       if (aprs_en and ((tx[7] != 999.0) or (tx[8] != 999.0))):
                         s_aprs = ysfaprs.aprs_string(re.split(r'[-/]', tx[3].strip())[0], tx[7], tx[8], radio_code, str(refl_id).zfill(5), aprs_ssid)
                         if (len(s_aprs) > 5):
@@ -1363,7 +1732,7 @@ def RunServer(config):
                 num_cli = len(clients)
               if (sock[1] == 0):    
                 info = 'YSFS' + str(refl_id).zfill(5) + refl_name.ljust(16) + refl_desc.ljust(14) + str(num_cli).zfill(3)
-                s.sendto(str.encode(info),addr)
+                safe_sendto(s, str.encode(info), addr)
               else:
                 r = []
                 for r in REF_ALIAS:
@@ -1371,12 +1740,12 @@ def RunServer(config):
                     break
                 if (r):
                   info = 'YSFS' + str(r[1]).zfill(5) + r[2].ljust(16) + r[3].ljust(14) + str(num_cli).zfill(3)     
-                  s.sendto(str.encode(info),addr)  
+                  safe_sendto(s, str.encode(info), addr)  
                               
             if (cmd == b'YSFV'):
               printlog(0, 'Received command ' + cmd.decode() + ' from: ' + addr[0] + ':' + str(addr[1]))
               info = 'YSFV' + 'pYSFReflector' + ' ' + version
-              s.sendto(str.encode(info),addr)  
+              safe_sendto(s, str.encode(info), addr)  
  
             if (cmd == b'YSFI'):
               # Maybe we can do something usefull with this infos later?
@@ -1393,11 +1762,9 @@ def RunServer(config):
                 opt_dg_i = 0
 
               if opt_dg_i in dgid_list:
-                pres = False
-                for c in clients:
-                  if ((c[0] == addr[0]) and (c[1] == addr[1]) and (c[11].getsockname()[0] == s.getsockname()[0]) and (c[11].getsockname()[1] == s.getsockname()[1])):
-                    pres = True
-                    break
+                # Use optimized client lookup
+                c = client_manager.find_client(addr[0], addr[1], s)
+                pres = c is not None
                 if (pres and (c[12] == 0) and (c[9] >= 0)):
                   lock_nodi.acquire()
                   c[12] = opt_dg_i
@@ -1406,13 +1773,58 @@ def RunServer(config):
                   lock_nodi.release()    
                   printlog(1, 'Static DG-ID (' + opt_dg + ') via Options for ' + gw)
     
+      except queue.Empty:
+        # Timeout waiting for data, continue to check shutdown flag
+        continue
       except Exception as e:
-        printlog(1, 'Infinite loop error: ' + str(e))        
-                                
-    s.close()
+        # Provide richer context for debugging: include traceback and relevant loop state
+        try:
+          import traceback as _tb
+          tb = _tb.format_exc()
+        except Exception:
+          tb = 'Unable to capture traceback'
+
+        # Collect some local context where possible
+        try:
+          cmd_repr = cmd.decode(errors='ignore') if 'cmd' in locals() and isinstance(cmd, (bytes, bytearray)) else str(globals().get('cmd', ''))
+        except Exception:
+          cmd_repr = '<unknown>'
+        try:
+          addr_repr = f'{addr[0]}:{addr[1]}' if 'addr' in locals() and addr else '<no addr>'
+        except Exception:
+          addr_repr = '<no addr>'
+        try:
+          sock_repr = '?'
+          if 'sock' in locals() and sock and hasattr(sock[0], 'getsockname'):
+            sock_repr = str(sock[0].getsockname())
+        except Exception:
+          sock_repr = '?'
+
+        try:
+          data_len = len(data_ns) if 'data_ns' in locals() and data_ns is not None else (len(data) if 'data' in locals() and data is not None else -1)
+        except Exception:
+          data_len = -1
+
+        printlog(1, f'Infinite loop error: {e} ; cmd={cmd_repr} ; addr={addr_repr} ; sock={sock_repr} ; data_len={data_len} ; clients={len(client_manager) if globals().get("client_manager") else "?"}')
+        printlog(1, tb)
+    
+    # Graceful shutdown
+    printlog(1, 'Shutting down server...')
+    for s in sock_list:
+        s[0].close()
+    sjson.close()
 
 
 def printlog(log_level, mess):
+  global debug
+  
+  if isinstance(log_level, int):
+    print(check_string('M: ' + str(datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S.%f'))[:-3] + ' ' + mess))
+  else:
+    if log_level == "d" and debug == 1:
+      print(check_string('D: ' + str(datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S.%f'))[:-3] + ' ' + mess))
+
+def printlog_orig(log_level, mess):
   global filelog
   global log_basename
   global file_rotate
@@ -1420,7 +1832,7 @@ def printlog(log_level, mess):
   global debug
   
   if file_rotate == "1":
-    log_file = log_basename + '-' + str(datetime.datetime.now(datetime.UTC).strftime('%Y-%m-%d')) + '.log'
+    log_file = log_basename + '-' + str(datetime.now(UTC).strftime('%Y-%m-%d')) + '.log'
   else:
     log_file = log_basename + '.log'
   try:
@@ -1433,10 +1845,10 @@ def printlog(log_level, mess):
     
   if isinstance(log_level, int):
     if file_level <= log_level:
-      str_log = check_string('M: ' + str(datetime.datetime.now(datetime.UTC).strftime('%Y-%m-%d %H:%M:%S.%f'))[:-3] + ' ' + mess)
+      str_log = check_string('M: ' + str(datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S.%f'))[:-3] + ' ' + mess)
   else:
     if log_level == "d" and debug == 1:
-      str_log = check_string('D: ' + str(datetime.datetime.now(datetime.UTC).strftime('%Y-%m-%d %H:%M:%S.%f'))[:-3] + ' ' + mess)
+      str_log = check_string('D: ' + str(datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S.%f'))[:-3] + ' ' + mess)
   try:
     filelog.write(str_log + '\n') 
     filelog.flush()
@@ -1465,7 +1877,595 @@ def hex_dump(data):
 
 ######## main ########
 
+# Configuration limits for stability
+MAX_CLIENTS = 1000
+MAX_W_PTT_ENTRIES = 10000
+MAX_STREAM_COUNT = 100
+MAX_SCHEDULED_TASKS = 1000
+MAX_QUEUE_SIZE = 50000
+
+# Global shutdown flag
+shutdown_requested = False
+
 version = '20240210'
+
+# Global fast lookup manager for optimized performance
+fast_lookup = None
+# Track last remote addr seen per socket fileno to provide context on recv timeouts
+last_recv_by_fd = {}
+
+# Resource Management Classes for Phase 2
+class SafeFileHandler:
+    """Context manager for safe file operations with automatic cleanup"""
+    def __init__(self, filename, mode='r', encoding='utf-8'):
+        self.filename = filename
+        self.mode = mode
+        self.encoding = encoding
+        self.file = None
+        
+    def __enter__(self):
+        try:
+            self.file = open(self.filename, self.mode, encoding=self.encoding)
+            return self.file
+        except (OSError, IOError) as e:
+            printlog(1, f'Failed to open file {self.filename}: {e}')
+            raise
+            
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.file:
+            try:
+                self.file.flush()
+                self.file.close()
+            except Exception as e:
+                printlog(1, f'Error closing file {self.filename}: {e}')
+        if exc_type:
+            printlog(1, f'Exception in file operation {self.filename}: {exc_type.__name__}: {exc_val}')
+        return False
+
+class SafeSocketHandler:
+    """Context manager for safe socket operations with automatic cleanup"""
+    def __init__(self, family=socket.AF_INET, type=socket.SOCK_DGRAM):
+        self.family = family
+        self.type = type
+        self.socket = None
+        
+    def __enter__(self):
+        try:
+            self.socket = socket.socket(self.family, self.type)
+            return self.socket
+        except OSError as e:
+            printlog(1, f'Failed to create socket: {e}')
+            raise
+            
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.socket:
+            try:
+                self.socket.close()
+            except Exception as e:
+                printlog(1, f'Error closing socket: {e}')
+        if exc_type:
+            printlog(1, f'Exception in socket operation: {exc_type.__name__}: {exc_val}')
+        return False
+
+class SafeDBHandler:
+    """Context manager for TinyDB with automatic cleanup"""
+    def __init__(self, db_path):
+        self.db_path = db_path
+        self.db = None
+        
+    def __enter__(self):
+        try:
+            self.db = TinyDB(self.db_path)
+            return self.db
+        except Exception as e:
+            printlog(1, f'Failed to open database {self.db_path}: {e}')
+            raise
+            
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.db:
+            try:
+                self.db.close()
+            except Exception as e:
+                printlog(1, f'Error closing database {self.db_path}: {e}')
+        if exc_type:
+            printlog(1, f'Exception in database operation: {exc_type.__name__}: {exc_val}')
+        return False
+
+def network_retry(max_retries=3, delay=0.1):
+    """Decorator to retry network operations with exponential backoff"""
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except (OSError, socket.error) as e:
+                    # Log each retry at debug level to avoid noisy INFO logs for expected transient errors
+                    try:
+                        printlog("d", f'Network operation {func.__name__} attempt {attempt+1}/{max_retries} failed: {e}')
+                    except Exception:
+                        pass
+
+                    # If this is a socket.timeout, keep it quieter (debug) and still retry — final timeout won't log at INFO
+                    if attempt == max_retries - 1:
+                        if isinstance(e, socket.timeout):
+                            # Try to enrich timeout message with last seen remote address and callsign (if available)
+                            extra_msg = ''
+                            sock_obj = None
+                            try:
+                                if len(args) > 0:
+                                    sock_obj = args[0]
+                                if sock_obj and hasattr(sock_obj, 'fileno'):
+                                    fd = sock_obj.fileno()
+                                    last_map = globals().get('last_recv_by_fd', {})
+                                    last = last_map.get(fd)
+                                    if last:
+                                        last_ip, last_port = last[0], last[1]
+                                        cm = globals().get('client_manager')
+                                        callsign = None
+                                        try:
+                                            if cm:
+                                                client = cm.find_client(last_ip, last_port, sock_obj)
+                                                if client and len(client) > 2:
+                                                    callsign = client[2]
+                                        except Exception:
+                                            callsign = None
+                                        if callsign:
+                                            extra_msg = f' Last seen from {last_ip}:{last_port} callsign={callsign}'
+                                        else:
+                                            extra_msg = f' Last seen from {last_ip}:{last_port}'
+                            except Exception:
+                                extra_msg = ''
+
+                            try:
+                                if extra_msg:
+                                    # If we have context about a last-seen remote, log at INFO so operator notices
+                                    sock_name = ''
+                                    try:
+                                        sock_name = str(sock_obj.getsockname())
+                                    except Exception:
+                                        sock_name = '?'
+                                    printlog(1, f'Network operation {func.__name__} timed out after {max_retries} attempts on socket {sock_name}.{extra_msg}')
+                                else:
+                                    printlog("d", f'Network operation {func.__name__} timed out after {max_retries} attempts')
+                            except Exception:
+                                pass
+                            raise
+                        else:
+                            printlog(1, f'Network operation {func.__name__} failed after {max_retries} attempts: {e}')
+                            raise
+
+                    time.sleep(delay * (2 ** attempt))  # Exponential backoff
+            return None
+        return wrapper
+    return decorator
+
+@network_retry(max_retries=3, delay=0.1)
+def safe_sendto(socket_obj, data, address):
+    """Safe sendto operation with retry logic"""
+    return socket_obj.sendto(data, address)
+
+@network_retry(max_retries=3, delay=0.1) 
+def safe_recvfrom(socket_obj, buffer_size):
+    """Safe recvfrom operation with retry logic"""
+    return socket_obj.recvfrom(buffer_size)
+
+def get_memory_usage():
+    """Get current memory usage information"""
+    if not PSUTIL_AVAILABLE:
+        return {
+            'rss_mb': 0.0,
+            'vms_mb': 0.0,
+            'percent': 0.0,
+            'available': False
+        }
+    
+    try:
+        process = psutil.Process()
+        memory_info = process.memory_info()
+        memory_percent = process.memory_percent()
+        return {
+            'rss_mb': memory_info.rss / 1024 / 1024,  # Resident set size in MB
+            'vms_mb': memory_info.vms / 1024 / 1024,  # Virtual memory size in MB  
+            'percent': memory_percent,
+            'available': True
+        }
+    except Exception as e:
+        printlog(1, f'Error getting memory usage: {e}')
+        return {
+            'rss_mb': 0.0,
+            'vms_mb': 0.0,
+            'percent': 0.0,
+            'available': False
+        }
+
+def cleanup_expired_data():
+    """Clean up expired data from global data structures"""
+    # Be defensive: some globals (client_manager, stream_manager) are created at runtime inside RunServer.
+    global W_PTT, SCHED
+    current_time = time.time()
+    cleaned_count = 0
+
+    # Clean expired W_PTT entries (older than 30 seconds)
+    try:
+        if len(W_PTT) > 0:
+            original_count = len(W_PTT)
+            new_wptt = []
+            for entry in W_PTT:
+                # Support both legacy list form [call, ts] and dict form {'time': ts}
+                try:
+                    t = entry.get('time') if isinstance(entry, dict) else entry[1]
+                except Exception:
+                    t = 0
+                if (current_time - t) < 30.0:
+                    new_wptt.append(entry)
+            W_PTT[:] = new_wptt
+            cleaned_count += original_count - len(W_PTT)
+    except Exception as e:
+        printlog(1, f'Error cleaning W_PTT: {e}')
+
+    # Clean expired client connections using optimized method if available
+    try:
+        cm = globals().get('client_manager')
+        if cm is not None:
+            expired_clients = []
+            for c in cm.get_all_clients():
+                if len(c) > 6 and (current_time - c[6]) >= 300.0:  # c[6] is t_conn
+                    expired_clients.append(c)
+            for c in expired_clients:
+                try:
+                    cm.remove_client(c)
+                    cleaned_count += 1
+                except Exception as e:
+                    printlog(1, f'Error removing expired client: {e}')
+    except Exception as e:
+        printlog(1, f'Error during client cleanup: {e}')
+
+    # Clean expired stream data using optimized method if available
+    try:
+        sm = globals().get('stream_manager')
+        if sm is not None:
+            cleaned_count += sm.cleanup_expired(current_time, 60.0)
+    except Exception as e:
+        printlog(1, f'Error during stream cleanup: {e}')
+
+    # Clean old APRS last heard entries (older than 1800 seconds) if APRS_LH is present
+    try:
+        if 'APRS_LH' in globals() and len(APRS_LH) > 0:
+            original_count = len(APRS_LH)
+            try:
+                APRS_LH[:] = [entry for entry in APRS_LH if (current_time - (entry[3] if isinstance(entry, (list, tuple)) and len(entry) > 3 else entry.get('time', 0))) < 1800.0]
+            except Exception:
+                # Fallback: try a safer filter assuming list entries with index 3
+                APRS_LH[:] = [entry for entry in APRS_LH if (isinstance(entry, (list, tuple)) and len(entry) > 3 and (current_time - entry[3]) < 1800.0)]
+            cleaned_count += original_count - len(APRS_LH)
+    except Exception as e:
+        printlog(1, f'Error cleaning APRS_LH: {e}')
+
+    return cleaned_count
+
+def memory_monitor():
+    """Monitor memory usage and trigger cleanup if needed"""
+    memory_info = get_memory_usage()
+    
+    if not memory_info.get('available', False):
+        # If psutil is not available, still run periodic cleanup
+        if int(time.time()) % 300 == 0:  # Every 5 minutes
+            cleaned = cleanup_expired_data()
+            gc.collect()
+            if cleaned > 0:
+                printlog(2, f'Periodic cleanup: removed {cleaned} expired items')
+        return
+    
+    # Log memory usage every 5 minutes
+    if int(time.time()) % 300 == 0:
+        printlog(2, f'Memory usage: RSS={memory_info["rss_mb"]:.1f}MB, Percent={memory_info["percent"]:.1f}%')
+    
+    # Trigger cleanup if memory usage is high
+    if memory_info['percent'] > 75.0 or memory_info['rss_mb'] > 500.0:
+        cleaned = cleanup_expired_data()
+        gc.collect()  # Force garbage collection
+        new_memory = get_memory_usage()
+        printlog(1, f'High memory usage detected ({memory_info["percent"]:.1f}%), cleaned {cleaned} items, '
+                    f'memory reduced from {memory_info["rss_mb"]:.1f}MB to {new_memory["rss_mb"]:.1f}MB')
+        
+        # If memory is still high after cleanup, log a warning
+        if new_memory.get('available', False) and new_memory['percent'] > 85.0:
+            printlog(1, f'WARNING: Memory usage still high after cleanup: {new_memory["percent"]:.1f}%')
+
+# Performance optimization data structures
+class ClientLookup:
+    """Optimized client lookup using hash maps for O(1) performance"""
+    def __init__(self):
+        self.clients = []  # Keep original list for compatibility
+        self.client_map = {}  # addr_port -> client index for fast lookup
+        self.dgid_clients = defaultdict(list)  # dgid -> list of client indices
+        self.socket_clients = defaultdict(list)  # socket_addr -> list of client indices
+        # Reentrant lock to guard concurrent modifications and lookups
+        self.lock = threading.RLock()
+
+    def add_client(self, client):
+        """Add client with optimized indexing"""
+        with self.lock:
+            index = len(self.clients)
+            self.clients.append(client)
+
+            # Create lookup keys
+            addr_key = f"{client[0]}:{client[1]}"
+            if len(client) > 11 and hasattr(client[11], 'getsockname'):
+                try:
+                    socket_key = f"{client[11].getsockname()[0]}:{client[11].getsockname()[1]}"
+                    self.socket_clients[socket_key].append(index)
+                except Exception:
+                    # Be defensive if getsockname fails
+                    pass
+
+            self.client_map[addr_key] = index
+            if len(client) > 8:
+                self.dgid_clients[client[8]].append(index)
+
+            return index
+
+    def find_client(self, addr_ip, addr_port, socket_obj=None):
+        """Fast client lookup by address and socket"""
+        addr_key = f"{addr_ip}:{addr_port}"
+        with self.lock:
+            client_idx = self.client_map.get(addr_key)
+
+            if client_idx is None:
+                return None
+
+            # Defensive check: index may be stale if another thread modified clients
+            if client_idx < 0 or client_idx >= len(self.clients):
+                # Rebuild indices safely and try again
+                try:
+                    self._rebuild_indices()
+                except Exception:
+                    pass
+
+                client_idx = self.client_map.get(addr_key)
+                if client_idx is None:
+                    return None
+                if client_idx < 0 or client_idx >= len(self.clients):
+                    # Give up and fallback to linear search
+                    for c in self.clients:
+                        if len(c) > 1 and c[0] == addr_ip and c[1] == addr_port:
+                            return c
+                    return None
+
+            client = self.clients[client_idx]
+
+            # Verify socket match if provided
+            if socket_obj and len(client) > 11 and hasattr(client[11], 'getsockname'):
+                try:
+                    if (client[11].getsockname()[0] != socket_obj.getsockname()[0] or 
+                        client[11].getsockname()[1] != socket_obj.getsockname()[1]):
+                        return None
+                except Exception:
+                    # If getsockname fails, be conservative and require direct match via addr
+                    return None
+
+            return client
+
+    def remove_client(self, client):
+        """Remove client and update indices"""
+        try:
+            with self.lock:
+                index = self.clients.index(client)
+                addr_key = f"{client[0]}:{client[1]}"
+
+                # Remove from maps
+                if addr_key in self.client_map:
+                    del self.client_map[addr_key]
+
+                if len(client) > 8:
+                    dgid_list = self.dgid_clients.get(client[8], [])
+                    if index in dgid_list:
+                        dgid_list.remove(index)
+
+                # Remove from socket map
+                if len(client) > 11 and hasattr(client[11], 'getsockname'):
+                    try:
+                        socket_key = f"{client[11].getsockname()[0]}:{client[11].getsockname()[1]}"
+                        socket_list = self.socket_clients.get(socket_key, [])
+                        if index in socket_list:
+                            socket_list.remove(index)
+                    except Exception:
+                        pass
+
+                # Remove from clients list
+                self.clients.remove(client)
+                self._rebuild_indices()
+
+        except ValueError:
+            pass  # Client not in list
+
+    def _rebuild_indices(self):
+        """Rebuild all indices after removal"""
+        with self.lock:
+            self.client_map.clear()
+            self.dgid_clients.clear()
+            self.socket_clients.clear()
+
+            for i, client in enumerate(self.clients):
+                addr_key = f"{client[0]}:{client[1]}"
+                self.client_map[addr_key] = i
+
+                if len(client) > 8:
+                    self.dgid_clients[client[8]].append(i)
+
+                if len(client) > 11 and hasattr(client[11], 'getsockname'):
+                    try:
+                        socket_key = f"{client[11].getsockname()[0]}:{client[11].getsockname()[1]}"
+                        self.socket_clients[socket_key].append(i)
+                    except Exception:
+                        pass
+    
+    def get_clients_by_dgid(self, dgid):
+        """Get all clients for a specific DG-ID"""
+        indices = self.dgid_clients.get(dgid, [])
+        return [self.clients[i] for i in indices if i < len(self.clients)]
+    
+    def get_all_clients(self):
+        """Get all clients (for backward compatibility)"""
+        return self.clients
+    
+    def __len__(self):
+        return len(self.clients)
+
+class StreamManager:
+    """Optimized stream management with hash-based lookups"""
+    def __init__(self):
+        self.streams = []  # Keep original list for compatibility
+        self.stream_by_id = {}  # stream_id -> stream
+        self.stream_by_dgid = defaultdict(list)  # dgid -> list of streams
+    
+    def add_stream(self, stream):
+        """Add stream with optimized indexing"""
+        self.streams.append(stream)
+        if len(stream) > 0:
+            self.stream_by_id[stream[0]] = stream
+        if len(stream) > 9:
+            self.stream_by_dgid[stream[9]].append(stream)
+    
+    def find_stream_by_id(self, stream_id):
+        """Fast stream lookup by ID"""
+        return self.stream_by_id.get(stream_id)
+    
+    def find_streams_by_dgid(self, dgid):
+        """Get all streams for a specific DG-ID"""
+        return self.stream_by_dgid.get(dgid, [])
+    
+    def remove_stream(self, stream):
+        """Remove stream and update indices"""
+        try:
+            self.streams.remove(stream)
+            
+            if len(stream) > 0 and stream[0] in self.stream_by_id:
+                del self.stream_by_id[stream[0]]
+            
+            if len(stream) > 9:
+                dgid_streams = self.stream_by_dgid.get(stream[9], [])
+                if stream in dgid_streams:
+                    dgid_streams.remove(stream)
+                    
+        except ValueError:
+            pass  # Stream not in list
+    
+    def get_all_streams(self):
+        """Get all streams (for backward compatibility)"""
+        return self.streams
+    
+    def cleanup_expired(self, current_time, max_age=60.0):
+        """Remove expired streams efficiently"""
+        active_streams = []
+        removed_count = 0
+        
+        for stream in self.streams:
+            if len(stream) > 6 and (current_time - stream[6]) < max_age:
+                active_streams.append(stream)
+            else:
+                removed_count += 1
+                # Clean up indices
+                if len(stream) > 0 and stream[0] in self.stream_by_id:
+                    del self.stream_by_id[stream[0]]
+                if len(stream) > 9:
+                    dgid_streams = self.stream_by_dgid.get(stream[9], [])
+                    if stream in dgid_streams:
+                        dgid_streams.remove(stream)
+        
+        self.streams = active_streams
+        return removed_count
+    
+    def __len__(self):
+        return len(self.streams)
+
+class FastLookupManager:
+    """Manages fast set-based lookups for blacklists and whitelists"""
+    def __init__(self):
+        # Convert sorted lists to sets for O(1) lookup
+        self.black_list_set = set()
+        self.white_list_set = set()
+        self.gw_bl_set = set()
+        self.ip_bl_set = set()
+        self.gw_lk_set = set()
+        self.ip_lk_set = set()
+        self.suf_bl_set = set()
+        self.sn_bl_set = set()
+        self.blk_tmp_set = set()
+        
+        # Keep track of which lists need updating
+        self._needs_sync = True
+    
+    def sync_from_lists(self, black_list, white_list, gw_bl, ip_bl, gw_lk, ip_lk, suf_bl, sn_bl, blk_tmp):
+        """Sync sets from sorted lists for fast lookups"""
+        self.black_list_set = set(black_list)
+        self.white_list_set = set(white_list)
+        self.gw_bl_set = set(gw_bl)
+        self.ip_bl_set = set(ip_bl)
+        self.gw_lk_set = set(gw_lk)
+        self.ip_lk_set = set(ip_lk)
+        self.suf_bl_set = set(suf_bl)
+        self.sn_bl_set = set(sn_bl)
+        self.blk_tmp_set = set(blk_tmp)
+        self._needs_sync = False
+    
+    def is_in_black_list(self, item):
+        """Fast blacklist lookup - O(1) instead of O(log n)"""
+        return item in self.black_list_set
+    
+    def is_in_white_list(self, item):
+        """Fast whitelist lookup - O(1) instead of O(log n)"""
+        return item in self.white_list_set
+    
+    def is_in_gw_bl(self, item):
+        """Fast gateway blacklist lookup - O(1) instead of O(log n)"""
+        return item in self.gw_bl_set
+    
+    def is_in_ip_bl(self, item):
+        """Fast IP blacklist lookup - O(1) instead of O(log n)"""
+        return item in self.ip_bl_set
+    
+    def is_in_gw_lk(self, item):
+        """Fast gateway lock lookup - O(1) instead of O(log n)"""
+        return item in self.gw_lk_set
+    
+    def is_in_ip_lk(self, item):
+        """Fast IP lock lookup - O(1) instead of O(log n)"""
+        return item in self.ip_lk_set
+    
+    def is_in_suf_bl(self, item):
+        """Fast suffix blacklist lookup - O(1) instead of O(log n)"""
+        return item in self.suf_bl_set
+    
+    def is_in_sn_bl(self, item):
+        """Fast serial number blacklist lookup - O(1) instead of O(log n)"""
+        return item in self.sn_bl_set
+    
+    def is_in_blk_tmp(self, item):
+        """Fast temporary block lookup - O(1) instead of O(log n)"""
+        return item in self.blk_tmp_set
+    
+    def add_to_blk_tmp(self, item):
+        """Add item to temporary block set"""
+        self.blk_tmp_set.add(item)
+    
+    def remove_from_blk_tmp(self, item):
+        """Remove item from temporary block set"""
+        self.blk_tmp_set.discard(item)
+    
+    def mark_for_sync(self):
+        """Mark that sets need to be re-synced from lists"""
+        self._needs_sync = True
+    
+    def needs_sync(self):
+        """Check if sync is needed"""
+        return self._needs_sync
+
+def signal_handler(signum, frame):
+    global shutdown_requested
+    printlog(1, f'Received signal {signum}, initiating graceful shutdown...')
+    shutdown_requested = True
 
 if (len(sys.argv) != 2):
   print('Invalid Number of Arguments')
@@ -1493,7 +2493,7 @@ debug = config[13]
 
 ### log
 if file_rotate == "1":
-  log_file = log_basename + '-' + str(datetime.datetime.now(datetime.UTC).strftime('%Y-%m-%d')) + '.log'
+  log_file = log_basename + '-' + str(datetime.now(UTC).strftime('%Y-%m-%d')) + '.log'
 else:
   log_file = log_basename + '.log'
 try:
@@ -1502,8 +2502,18 @@ try:
   else:
     filelog = open(log_file,'x')
 except Exception as e:
-  print('Unable to Open Log File: ' + str(e))
-  sys.exit()
+  # In containerized environments the configured path may not exist or be writable.
+  # Fall back to stdout so docker logs and consoles still see runtime logs instead of exiting.
+  try:
+    print(f'WARNING: Unable to open configured log file "{log_file}": {e}. Falling back to stdout for logging.')
+  except Exception:
+    pass
+  try:
+    filelog = sys.stdout
+  except Exception:
+    # As a last resort, give up and exit (very unlikely)
+    print('FATAL: Cannot open log file and cannot fall back to stdout')
+    sys.exit(1)
   
 BLACK_LIST = [] 
 WHITE_LIST = [] 
@@ -1520,6 +2530,15 @@ GW_HOME = []
 APRS_STR = queue.Queue()
 lock_tx = threading.Lock()
 lock_nodi = threading.Lock()
-RunServer(config)
+
+# Register signal handlers for graceful shutdown
+signal.signal(signal.SIGTERM, signal_handler)
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGHUP, signal_handler)
+
+if __name__ == '__main__':
+  # Only run the server when executed as a script; importing this module for
+  # tests should not start network listeners or threads.
+  RunServer(config)
 
   
