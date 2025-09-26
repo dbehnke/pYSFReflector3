@@ -25,6 +25,12 @@ If you want to reproduce the exact environment recorded in the repository lockfi
   # sync project environment from uv.lock
   uv sync
 
+To verify the lockfile is up-to-date with the project metadata (local check), run:
+
+  uv lock --check
+
+If this command exits with a non-zero status, the `uv.lock` file is stale and you should update it with `uv lock` and commit the result.
+
 CI notes
 
 - The GitHub Actions workflow installs `uv` via the upstream curl installer:
