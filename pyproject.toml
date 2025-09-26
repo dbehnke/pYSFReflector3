@@ -8,3 +8,6 @@ dependencies = []
 [tool.uv]
 # Let uv manage the project environment by default
 managed = true
+
+[project.optional-dependencies]
+dev = ["pytest"]

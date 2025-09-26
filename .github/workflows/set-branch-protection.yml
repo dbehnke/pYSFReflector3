@@ -14,10 +14,19 @@ jobs:
       - name: Configure branch protection via REST API
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PAT_FOR_PROTECTION: ${{ secrets.PAT_FOR_PROTECTION }}
         run: |
           set -e
           echo "Configuring branch protection for 'main' (require 1 approving review, admins exempt)..."
           API_URL="https://api.github.com/repos/${{ github.repository }}/branches/main/protection"
           # Require the CI workflow to pass before merging
           PAYLOAD=$(printf '%s' '{"required_status_checks":{"strict":true,"contexts":["CI"]},"enforce_admins":false,"required_pull_request_reviews":{"dismiss_stale_reviews":false,"require_code_owner_reviews":false,"required_approving_review_count":1},"restrictions":null}')
-          curl -sS -X PUT -H "Accept: application/vnd.github+json" -H "Authorization: Bearer $GITHUB_TOKEN" "$API_URL" -d "$PAYLOAD" | jq .
+          # Read optional PAT secret at runtime to avoid invalid context evaluation
+          if [ -n "$PAT_FOR_PROTECTION" ]; then
+            AUTH_TOKEN="$PAT_FOR_PROTECTION"
+            echo "Using PAT from repo secret 'PAT_FOR_PROTECTION'"
+          else
+            AUTH_TOKEN="$GITHUB_TOKEN"
+            echo "Using GITHUB_TOKEN (may be blocked by org policy)"
+          fi
+          curl -sS -X PUT -H "Accept: application/vnd.github+json" -H "Authorization: Bearer $AUTH_TOKEN" "$API_URL" -d "$PAYLOAD" | jq .
