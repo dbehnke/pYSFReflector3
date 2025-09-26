@@ -37,10 +37,13 @@ jobs:
         run: |
           curl -LsSf https://astral.sh/uv/install.sh | sh
 
-      - name: Install project dependencies via uv
+      - name: Sync project environment from uv.lock (or install from requirements)
         run: |
-          # Use uv to install from requirements.txt (uv will create/manage the venv)
-          if [ -f requirements.txt ]; then
+          # If uv.lock exists, use uv sync to reproduce exact environment
+          if [ -f uv.lock ]; then
+            uv sync
+          elif [ -f requirements.txt ]; then
+            # Fallback: install from requirements.txt
             uv install -r requirements.txt
           else
             uv install pytest

@@ -20,6 +20,11 @@ From the project root (`/path/to/pYSFReflector3`):
   # run tests inside uv-managed environment
   uv run pytest -q
 
+If you want to reproduce the exact environment recorded in the repository lockfile, use `uv sync` (this will read `uv.lock` and create/update `.venv` accordingly):
+
+  # sync project environment from uv.lock
+  uv sync
+
 CI notes
 
 - The GitHub Actions workflow installs `uv` via the upstream curl installer:
