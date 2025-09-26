@@ -3,16 +3,29 @@ Running tests
 This project includes a concurrency unit test for the `ClientLookup` class.
 
 Prerequisites
-- Use the project's virtualenv Python at `pyenv/bin/python`.
-- Install test runner if needed (we use pytest in the venv). To install:
+- Developer: install `uv` locally (we assume developers install it ahead of time). The CI uses the uv curl installer.
+- Optionally install uv with pipx for local development:
 
-  /Users/dbehnke/development/pYSFReflector3/pyenv/bin/python -m pip install pytest
+  python -m pip install --upgrade pip pipx
+  python -m pipx ensurepath
+  python -m pipx install uv
 
-Run tests
+Run tests (developer)
 
 From the project root (`/path/to/pYSFReflector3`):
 
-  /Users/dbehnke/development/pYSFReflector3/pyenv/bin/pytest -q
+  # install project deps into uv-managed venv
+  uv install -r requirements.txt
+
+  # run tests inside uv-managed environment
+  uv run pytest -q
+
+CI notes
+
+- The GitHub Actions workflow installs `uv` via the upstream curl installer:
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+
+- CI then runs `uv install -r requirements.txt` and `uv run pytest -q`.
 
 Notes
 - The `YSFReflector` script contains runtime startup code; tests import only the `ClientLookup` class by extracting its source to avoid starting the server. Do not run `YSFReflector` directly while running tests unless you want the server to run.
