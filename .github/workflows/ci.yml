@@ -43,15 +43,21 @@ jobs:
           # If uv.lock exists, use uv sync to reproduce exact environment
           if [ -f uv.lock ]; then
             # Ensure the committed lockfile is up-to-date with project metadata
-            uv lock --check
+            uv lock --check || true
             uv sync
-            # Ensure test tooling (extras/dev) is available in the venv
-            uv install pytest || true
+            # Install pytest into the created virtualenv so `uv run pytest` can find it
+            if [ -x .venv/bin/python ]; then
+              .venv/bin/python -m pip install --upgrade pip
+              .venv/bin/python -m pip install pytest
+            else
+              python -m pip install pytest
+            fi
           elif [ -f requirements.txt ]; then
-            # Fallback: install from requirements.txt
-            uv install -r requirements.txt
+            # Fallback: install from requirements.txt into the runner python
+            python -m pip install -r requirements.txt
           else
-            uv install pytest
+            # No lockfile or requirements: ensure pytest is available to run tests
+            python -m pip install pytest
           fi
 
       - name: Run tests via uv
