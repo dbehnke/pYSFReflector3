@@ -47,9 +47,13 @@ jobs:
             uv sync
             # Install pytest into the created virtualenv so `uv run pytest` can find it
             if [ -x .venv/bin/python ]; then
-              .venv/bin/python -m pip install --upgrade pip
+              # Ensure pip is available inside the venv created by uv
+              .venv/bin/python -m ensurepip --upgrade || true
+              .venv/bin/python -m pip install --upgrade pip setuptools wheel
               .venv/bin/python -m pip install pytest
             else
+              python -m ensurepip --upgrade || true
+              python -m pip install --upgrade pip setuptools wheel
               python -m pip install pytest
             fi
           elif [ -f requirements.txt ]; then
